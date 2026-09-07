@@ -1,0 +1,21 @@
+# Dependencies
+node_modules/
+
+# Next.js build output
+.next/
+out/
+
+# TypeScript incremental build info
+tsconfig.tsbuildinfo
+
+# Environment
+.env*
+!.env.example
+
+# Logs
+*.log
+*.log.err
+
+# OS
+.DS_Store
+Thumbs.db.freebuff/
