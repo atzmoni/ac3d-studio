@@ -1,5 +1,3 @@
-export type PatternId = 'diamond-fold';
-
 export type MaterialId = 'acp-4' | 'acp-3' | 'acrylic-3' | 'steel-2' | 'cardboard-2';
 
 export type FoldKind = 'mountain' | 'valley' | 'cut';
@@ -10,7 +8,6 @@ export interface PatternParameters {
   targetHeight: number;
   rows: number;
   columns: number;
-  cellSize: number;
   vBitAngle: number;
   foldProgress: number;
   invertFolds: boolean;
@@ -27,17 +24,6 @@ export interface MaterialSpec {
   maxBendAngle: number;
   grooveDepth: string;
   recommendedCell: number;
-  risk: 'low' | 'medium' | 'high';
-}
-
-export interface PatternDefinition {
-  id: PatternId;
-  name: string;
-  category: string;
-  description: string;
-  applications: string[];
-  difficulty: 'Low' | 'Medium' | 'High';
-  recommendedMaterial: MaterialId;
 }
 
 export interface FoldLine {
