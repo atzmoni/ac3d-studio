@@ -18,4 +18,8 @@ tsconfig.tsbuildinfo
 
 # OS
 .DS_Store
-Thumbs.db.freebuff/
+Thumbs.db
+
+# Local tooling scratch
+.freebuff/
+.vercel
