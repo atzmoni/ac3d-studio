@@ -22,4 +22,7 @@ Thumbs.db
 
 # Local tooling scratch
 .freebuff/
+
+# Deployment — the link and the token it writes beside it stay local
 .vercel
+.env*

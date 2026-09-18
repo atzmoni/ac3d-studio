@@ -1,9 +1,17 @@
 import { describe, expect, it } from 'vitest';
 import {
-  buildPlanterDxf, buildPlanterModel, buildPlanterSvg, DEFAULT_PLANTER, getPlanterChecks,
-  getPlanterStats, normalizePlanter, planterVolumeLitres,
+  buildPlanterDxf, buildPlanterModel, buildPlanterPrintSvg, buildPlanterSvg, DEFAULT_PLANTER,
+  getPlanterChecks, getPlanterStats, litPlanter, normalizePlanter, planterVolumeLitres,
 } from './planter-engine';
+import {
+  CUSTOM_PALETTE, DEFAULT_GROUT, DEFAULT_PRINT_COLOURS, MAX_GROUT, MAX_PRINT_TONES,
+  PRINT_PALETTES, PRINT_RULES,
+} from './planter-print';
 import { BLANK_PLANTER, PLANTER_CATEGORIES, PLANTER_PRESETS, PLANTER_STYLES } from './planter-styles';
+import { getLedEffect, LED_EFFECTS } from './planter-led-effects';
+import { flapSlit } from './planter-perforation';
+import { MAX_COAT_MM, STONE_MATERIALS, STONE_SEALS } from './planter-stone';
+import { checksHe, STONE_HE } from './planter-i18n-he';
 import { getMaterial } from './pattern-engine';
 import type { PlanterModel, PlanterParameters, PlanterPiece, Vec2 } from './types';
 
@@ -554,6 +562,1272 @@ describe('input handling', () => {
       expect(allPoints(model).every((point) => Number.isFinite(point.x) && Number.isFinite(point.y))).toBe(true);
       expect(buildPlanterDxf(model)).not.toMatch(/NaN/);
       expect(Number.isFinite(model.sheet.width) && model.sheet.width > 0).toBe(true);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Lighting
+// ---------------------------------------------------------------------------
+
+/** A pot with the whole lighting kit on it, sized so every part of it fits. */
+const LIT: Partial<PlanterParameters> = {
+  style: 'crystal', sides: 6, topDiameter: 380, bottomDiameter: 320, height: 520, rows: 3,
+  perforation: 'triangles', perfDensity: 2, perfSkirt: 90, rimWidth: 95,
+  liner: true, cavity: 22, solar: true,
+};
+
+/** A pot with facets big enough that a fine pattern still has room in them. */
+const BIG: Partial<PlanterParameters> = {
+  ...LIT, topDiameter: 600, bottomDiameter: 540, height: 800, rows: 4, rimWidth: 110,
+};
+
+const wallPieces = (model: PlanterModel) => model.pieces.filter(
+  (piece) => piece.id === 'wall' || piece.id.startsWith('band-'),
+);
+
+/** Distance from `point` to the segment a→b. */
+function toSegment(point: Vec2, a: Vec2, b: Vec2): number {
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  const span = dx * dx + dy * dy;
+  const t = span <= 0 ? 0 : Math.max(0, Math.min(1, ((point.x - a.x) * dx + (point.y - a.y) * dy) / span));
+  return Math.hypot(point.x - (a.x + dx * t), point.y - (a.y + dy * t));
+}
+
+const toRing = (point: Vec2, ring: Vec2[]) => ring.reduce(
+  (nearest, a, i) => Math.min(nearest, toSegment(point, a, ring[(i + 1) % ring.length])),
+  Infinity,
+);
+
+/**
+ * Is `point` inside a closed contour? Ray casting rather than a half-plane
+ * test, because a wall net's outline is anything but convex — it is a zigzag of
+ * fold-in tabs down two of its edges, and a convexity test would call the
+ * material between them outside.
+ */
+function insideRing(point: Vec2, ring: Vec2[]): boolean {
+  let inside = false;
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i, i += 1) {
+    const a = ring[i];
+    const b = ring[j];
+    if ((a.y > point.y) !== (b.y > point.y)
+      && point.x < ((b.x - a.x) * (point.y - a.y)) / (b.y - a.y) + a.x) inside = !inside;
+  }
+  return inside;
+}
+
+describe('perforated wall', () => {
+  it('changes nothing at all when it is switched off', () => {
+    const model = build();
+    expect(model.perfCells).toEqual([]);
+    expect(model.perfDropped).toBe(0);
+    expect(model.perfOpenArea).toBe(0);
+    expect(model.liner).toBeNull();
+    for (const piece of model.pieces) {
+      if (piece.id !== 'rim') expect(piece.holes).toEqual([]);
+    }
+    expect(model.pieces.map((piece) => piece.id)).toEqual(['wall', 'base', 'rim']);
+  });
+
+  it('cuts out of the wall and nothing else', () => {
+    const model = build(LIT);
+    const cut = model.pieces.filter((piece) => piece.holes.length > 0).map((piece) => piece.id);
+    // The collar's two are the planting hole and the panel window; the two
+    // floors' are drains. Nothing is cut into the liner's wall — it is the
+    // barrier, and a barrier with holes in it is not one.
+    expect(cut.sort()).toEqual(['base', 'liner-base', 'rim', 'wall']);
+    expect(wallPieces(model)[0].holes.length).toBeGreaterThan(0);
+    expect(model.pieces.find((piece) => piece.id === 'liner-wall')?.holes).toEqual([]);
+  });
+
+  it('keeps every cut-out inside its own piece and clear of every crease', () => {
+    // The one property that has to hold or the part is scrap: a hole that
+    // crosses a fold is a fold that tears, and one that crosses the outline is
+    // a part that falls in two on the bed.
+    const cases: Partial<PlanterParameters>[] = [
+      LIT,
+      { ...LIT, construction: 'banded', bulge: 18 },
+      // A fine fretwork on a big pot: small cells, thin webs, a small cutter.
+      {
+        ...LIT, topDiameter: 520, bottomDiameter: 460, height: 700,
+        perfDensity: 5, perfWeb: 4, perfMargin: 14, perfTool: 3,
+      },
+      { ...LIT, footprint: 'rectangle', topWidth: 480, topLength: 340, bottomWidth: 420, bottomLength: 280 },
+    ];
+    for (const overrides of cases) {
+      const model = build(overrides);
+      const margin = model.parameters.perfMargin;
+      // Per model, not per piece: a band that sits entirely under the skirt
+      // rightly comes off the sheet with no cut-outs at all.
+      expect(wallPieces(model).reduce((count, piece) => count + piece.holes.length, 0)).toBeGreaterThan(0);
+      for (const piece of wallPieces(model)) {
+        for (const hole of piece.holes) {
+          for (const point of hole) {
+            expect(insideRing(point, piece.outline)).toBe(true);
+            for (const fold of piece.folds) {
+              // Within a twentieth of a millimetre of the border asked for,
+              // which is a good router's own positional accuracy — a pattern
+              // stamped from a neighbouring facet follows that facet's own
+              // development, and on a wall that does not develop perfectly the
+              // two are a few microns apart.
+              expect(toSegment(point, { x: fold.x1, y: fold.y1 }, { x: fold.x2, y: fold.y2 }))
+                .toBeGreaterThanOrEqual(margin - 0.05);
+            }
+          }
+        }
+      }
+    }
+  });
+
+  it('holds the web between every pair of cut-outs on a piece', () => {
+    const model = build({ ...LIT, perfDensity: 3, perfWeb: 15 });
+    for (const piece of wallPieces(model)) {
+      const { holes } = piece;
+      for (let i = 0; i < holes.length; i += 1) {
+        for (let j = i + 1; j < holes.length; j += 1) {
+          const gap = Math.min(
+            ...holes[i].map((point) => toRing(point, holes[j])),
+            ...holes[j].map((point) => toRing(point, holes[i])),
+          );
+          // Same twentieth of a millimetre as the border above, and for the
+          // same reason: a stamped pattern rides its own facet's development.
+          expect(gap).toBeGreaterThanOrEqual(15 - 0.05);
+        }
+      }
+    }
+  });
+
+  it('leaves the foot solid up to the skirt', () => {
+    const skirt = 180;
+    const model = build({ ...LIT, perfSkirt: skirt, rows: 4 });
+    const stride = model.parameters.sides + 1;
+    expect(model.perfCells.length).toBeGreaterThan(0);
+    for (const facet of model.perfCells) {
+      const heights = model.triangles[facet.triangle].v.map(
+        (id) => model.vertices[Math.floor(id / stride)][id % stride].z,
+      );
+      // A facet that dips into the skirt is left whole, so the lowest corner of
+      // every perforated facet is at or above the line.
+      expect(Math.min(...heights)).toBeGreaterThanOrEqual(skirt - 1e-6);
+    }
+  });
+
+  it('carries the cut-outs onto the sheet in the same frame as the flat net', () => {
+    for (const overrides of [LIT, { ...LIT, construction: 'banded' as const }]) {
+      const model = build(overrides);
+      const cells = model.perfCells.reduce((count, facet) => count + facet.cells.length, 0);
+      const holes = wallPieces(model).reduce((count, piece) => count + piece.holes.length, 0);
+      expect(cells).toBe(holes);
+      for (const facet of model.perfCells) {
+        for (const cell of facet.cells) {
+          for (const point of cell) {
+            expect(point.x).toBeGreaterThanOrEqual(-1e-6);
+            expect(point.y).toBeGreaterThanOrEqual(-1e-6);
+            expect(point.x).toBeLessThanOrEqual(model.sheet.width + 1e-6);
+            expect(point.y).toBeLessThanOrEqual(model.sheet.height + 1e-6);
+          }
+        }
+      }
+    }
+  });
+
+  it('writes every cut-out into both export formats as a closed run', () => {
+    const model = build(LIT);
+    const cells = model.perfCells.reduce((count, facet) => count + facet.cells.length, 0);
+    expect(cells).toBeGreaterThan(0);
+    const svg = buildPlanterSvg(model, acp, 'Crystal Facet');
+    const solid = buildPlanterSvg(build(), acp, 'Crystal Facet');
+    expect((svg.match(/<polygon/g) ?? []).length - (solid.match(/<polygon/g) ?? []).length)
+      .toBeGreaterThanOrEqual(cells);
+    // R12 closes a run with bit 1 of group 70, so a cut-out arriving open would
+    // be cut as a slit that never meets itself.
+    const dxf = buildPlanterDxf(model);
+    expect((dxf.match(/\n70\n1\n/g) ?? []).length).toBeGreaterThanOrEqual(cells);
+    expect(dxf).not.toMatch(/NaN/);
+  });
+
+  it('reports what it opened up, and says so in the shop notes', () => {
+    const model = build(LIT);
+    const stats = getPlanterStats(model, acp);
+    const cells = model.perfCells.reduce((count, facet) => count + facet.cells.length, 0);
+    expect(stats.openArea).toBe(`${Math.round(model.perfOpenArea * 100)}% open · ${cells} cut-outs`);
+    expect(model.perfOpenArea).toBeGreaterThan(0);
+    expect(model.perfOpenArea).toBeLessThan(1);
+    expect(getPlanterStats(build(), acp).openArea).toBeUndefined();
+    expect(buildPlanterSvg(model, acp, 'Crystal Facet')).toContain('milled cut-outs');
+  });
+
+  it('keeps the one-click wall decorative rather than structural', () => {
+    // The whole point of the opening lever: a composite panel has to stay a
+    // panel, so the button takes a little material out and no more. Anything
+    // that pushes this up past a sixth of the wall has stopped decorating it.
+    // Every catalogue design, not just a convenient one: the button is offered
+    // on whatever is on the bench, so it has to stay decorative on all of them.
+    for (const preset of [...PLANTER_PRESETS, BLANK_PLANTER]) {
+      const model = build(litPlanter({ ...DEFAULT_PLANTER, ...preset.parameters }));
+      expect(model.perfCells.length).toBeGreaterThan(0);
+      expect(model.perfOpenArea).toBeGreaterThan(0.005);
+      expect(model.perfOpenArea).toBeLessThan(0.16);
+      expect(getPlanterChecks(model, acp).some((check) => check.id === 'perf-open')).toBe(false);
+    }
+  });
+
+  it('cuts the share of each cell it was asked for', () => {
+    // Opening is an area fraction, so halving it roughly halves what leaves the
+    // sheet — which is what makes it the lever to reach for when the panel is
+    // going soft, rather than the pattern fineness.
+    // At density 1 the cells are big enough that the opening is what binds. At
+    // a fine density the web takes over as the floor, which is the point of the
+    // web — so this is measured where the lever is actually the lever.
+    const wide = build({ ...LIT, perfDensity: 1, perfOpening: 70 });
+    const narrow = build({ ...LIT, perfDensity: 1, perfOpening: 12 });
+    expect(narrow.perfOpenArea).toBeLessThan(wide.perfOpenArea * 0.3);
+    expect(getPlanterChecks(wide, acp).some((check) => check.id === 'perf-open')).toBe(false);
+
+    // And the web is a floor the opening cannot talk its way past: asking for
+    // almost the whole cell still leaves a full web between neighbours.
+    const greedy = build({ ...LIT, perfDensity: 4, perfOpening: 90, perfWeb: 18 });
+    for (const piece of wallPieces(greedy)) {
+      const { holes } = piece;
+      for (let i = 0; i < holes.length; i += 1) {
+        for (let j = i + 1; j < holes.length; j += 1) {
+          const gap = Math.min(
+            ...holes[i].map((point) => toRing(point, holes[j])),
+            ...holes[j].map((point) => toRing(point, holes[i])),
+          );
+          expect(gap).toBeGreaterThanOrEqual(18 - 0.05);
+        }
+      }
+    }
+  });
+
+  it('cuts the count asked for, and the same one every time', () => {
+    // "Six of the thirty-six." Six per facet, on every facet that carries any.
+    const six = { ...BIG, perfDensity: 4, perfPicked: 6, perfWeb: 6, perfMargin: 12 };
+    const model = build(six);
+    expect(model.perfCells.length).toBeGreaterThan(0);
+    for (const facet of model.perfCells) expect(facet.cells).toHaveLength(6);
+    // Settled once: the same design cuts the same six, or a redraw is a lottery.
+    expect(build(six).perfCells).toEqual(model.perfCells);
+    // And 0 means the lot — sixteen at this fineness.
+    for (const facet of build({ ...six, perfPicked: 0 }).perfCells) expect(facet.cells).toHaveLength(16);
+  });
+
+  it('cuts and folds without taking anything off the sheet', () => {
+    const folded = build({ ...BIG, perforation: 'foldout', perfWeb: 8, perfMargin: 12 });
+    const solid = build({ ...BIG, perforation: 'none' });
+    const flaps = wallPieces(folded).reduce((count, piece) => count + piece.flaps.length, 0);
+    expect(flaps).toBeGreaterThan(0);
+
+    // No holes anywhere on the wall, and the petals are three-point flaps.
+    for (const piece of wallPieces(folded)) {
+      expect(piece.holes).toEqual([]);
+      for (const flap of piece.flaps) expect(flap).toHaveLength(3);
+    }
+
+    // The part weighs what it weighed before: a petal is still attached.
+    expect(getPlanterStats(folded, acp).estimatedWeight).toBe(getPlanterStats(solid, acp).estimatedWeight);
+    // But there is more cutting to do than on a plain wall.
+    expect(parseFloat(getPlanterStats(folded, acp).cutLength))
+      .toBeGreaterThan(parseFloat(getPlanterStats(solid, acp).cutLength));
+    expect(getPlanterStats(folded, acp).openArea).toContain('nothing removed');
+  });
+
+  it('gives every petal a hinge crease and an open cut, never a closed one', () => {
+    const model = build({ ...BIG, perforation: 'foldout', perfWeb: 8, perfMargin: 12 });
+    for (const piece of wallPieces(model)) {
+      const hinges = piece.folds.filter((fold) => fold.id.startsWith('flap'));
+      expect(hinges).toHaveLength(piece.flaps.length);
+      // Each hinge is exactly the flap's first edge — the one left uncut.
+      piece.flaps.forEach((flap, i) => {
+        expect(Math.hypot(hinges[i].x1 - flap[0].x, hinges[i].y1 - flap[0].y)).toBeLessThan(1e-6);
+        expect(Math.hypot(hinges[i].x2 - flap[1].x, hinges[i].y2 - flap[1].y)).toBeLessThan(1e-6);
+        expect(hinges[i].kind).toBe('mountain');
+      });
+      // The cut starts at one hinge end and finishes at the other, so it can
+      // never come back round and drop the petal out.
+      for (const flap of piece.flaps) {
+        const slit = flapSlit(flap as [Vec2, Vec2, Vec2], model.parameters.perfTool);
+        expect(Math.hypot(slit[0].x - flap[0].x, slit[0].y - flap[0].y)).toBeLessThan(1e-6);
+        const end = slit[slit.length - 1];
+        expect(Math.hypot(end.x - flap[1].x, end.y - flap[1].y)).toBeLessThan(1e-6);
+      }
+    }
+    // And the exports carry them as open runs.
+    const svg = buildPlanterSvg(model, acp, 'fold');
+    expect((svg.match(/<polyline/g) ?? []).length).toBeGreaterThan(0);
+  });
+
+  it('offers every pattern family on the same rules', () => {
+    for (const perforation of ['triangles', 'shards', 'dots', 'grid', 'foldout'] as const) {
+      const model = build({ ...BIG, perforation, perfWeb: 8, perfMargin: 12 });
+      const margin = model.parameters.perfMargin;
+      expect(model.perfCells.length).toBeGreaterThan(0);
+      for (const piece of wallPieces(model)) {
+        // Petals are held to the same border as holes: a cut that runs up to a
+        // crease weakens the fold just as much as a hole sitting next to it.
+        // A petal's own hinge is a crease it sits exactly on — that is what a
+        // hinge is. What has to hold is clearance from the WALL's creases.
+        const creases = piece.folds.filter((fold) => !fold.id.startsWith('flap'));
+        for (const hole of [...piece.holes, ...piece.flaps]) {
+          for (const point of hole) {
+            expect(insideRing(point, piece.outline)).toBe(true);
+            for (const fold of creases) {
+              expect(toSegment(point, { x: fold.x1, y: fold.y1 }, { x: fold.x2, y: fold.y2 }))
+                .toBeGreaterThanOrEqual(margin - 0.05);
+            }
+          }
+        }
+      }
+      expect(buildPlanterDxf(model)).not.toMatch(/NaN/);
+    }
+  });
+
+  it('dissolves the pattern into a solid base instead of stopping at a line', () => {
+    // The panel the reference shows: dense at the top, thinning down, gone by
+    // the foot. Measured as area per facet against the facet's own height.
+    const fade = build({ ...BIG, perfSkirt: 0, perfFade: 600, perfDensity: 3, perfWeb: 6, perfMargin: 12 });
+    const stride = fade.parameters.sides + 1;
+    const heightOf = (triangle: number) => {
+      const zs = fade.triangles[triangle].v.map((id) => fade.vertices[Math.floor(id / stride)][id % stride].z);
+      return (Math.min(...zs) + Math.max(...zs)) / 2;
+    };
+    const byHeight = fade.perfCells
+      .map((facet) => ({ z: heightOf(facet.triangle), area: facet.cells.reduce((sum, cell) => sum + polygonAreaOf(cell), 0) }))
+      .sort((a, b) => a.z - b.z);
+    expect(byHeight.length).toBeGreaterThan(4);
+    const low = byHeight[0].area;
+    const high = byHeight[byHeight.length - 1].area;
+    expect(low).toBeLessThan(high * 0.6);
+
+    // And without the fade the same pot is even from the skirt up.
+    const flatOut = build({ ...BIG, perfSkirt: 0, perfFade: 0, perfDensity: 3, perfWeb: 6, perfMargin: 12 });
+    const areas = flatOut.perfCells.map((facet) => facet.cells.reduce((sum, cell) => sum + polygonAreaOf(cell), 0));
+    expect(Math.min(...areas)).toBeGreaterThan(Math.max(...areas) * 0.6);
+  });
+
+  it('refuses to open a wall with nothing behind it', () => {
+    const open = getPlanterChecks(build({ ...LIT, liner: false }), acp);
+    expect(open.find((check) => check.id === 'perf-liner')?.severity).toBe('error');
+    expect(getPlanterChecks(build(LIT), acp).some((check) => check.id === 'perf-liner')).toBe(false);
+  });
+
+  it('still wants a liner behind a cut-and-fold wall', () => {
+    // Nothing left the sheet, but the openings are just as open.
+    const open = getPlanterChecks(build({ ...BIG, perforation: 'foldout', liner: false }), acp);
+    expect(open.find((check) => check.id === 'perf-liner')?.severity).toBe('error');
+  });
+
+  it('says so rather than silently cutting nothing', () => {
+    const none = build({ ...LIT, perfSkirt: 2000 });
+    expect(none.perfCells).toEqual([]);
+    expect(getPlanterChecks(none, acp).some((check) => check.id === 'perf-empty')).toBe(true);
+  });
+
+  it('cuts one facet and stamps it round, so every side carries the same pattern', () => {
+    const model = build(LIT);
+    const { sides } = model.parameters;
+    const perBand = sides * 2;
+    const byTriangle = new Map(model.perfCells.map((facet) => [facet.triangle, facet.cells]));
+
+    // Within a band every side is the same triangle turned round the axis, so
+    // the cut-outs on it are congruent — same count, same cell areas, in the
+    // same order. Anything else means a side got its own layout.
+    for (const facet of model.perfCells) {
+      const band = Math.floor(facet.triangle / perBand);
+      const parity = facet.triangle % 2;
+      const first = byTriangle.get(band * perBand + parity);
+      if (!first) continue;
+      expect(facet.cells).toHaveLength(first.length);
+      facet.cells.forEach((cell, index) => {
+        expect(cell).toHaveLength(first[index].length);
+        // Areas to a thousandth of a percent. They are not bit-identical: the
+        // facets they sit on come off the unfolder a few microns apart on any
+        // wall that is not perfectly developable, and the stamp follows the
+        // facet it lands on rather than pretending otherwise.
+        const area = polygonAreaOf(first[index]);
+        expect(Math.abs(polygonAreaOf(cell) - area) / area).toBeLessThan(1e-3);
+      });
+    }
+  });
+
+  it('will not stamp one facet onto a facet of a different shape', () => {
+    // A rectangle's long side and its end are not congruent. Squeezing one
+    // pattern onto the other would scale the border at the creases by whatever
+    // the squeeze was, so each shape gets its own layout — which shows up as
+    // the two carrying different cell areas.
+    const model = build({
+      ...LIT, footprint: 'rectangle', style: 'prism', rows: 2,
+      topWidth: 700, topLength: 280, bottomWidth: 640, bottomLength: 240,
+    });
+    const perBand = model.parameters.sides * 2;
+    const areaOf = (triangle: number) => (model.perfCells.find((facet) => facet.triangle === triangle)?.cells ?? [])
+      .reduce((sum, cell) => sum + polygonAreaOf(cell), 0);
+    const band = Math.floor((model.perfCells[0]?.triangle ?? 0) / perBand);
+    const longSide = areaOf(band * perBand);
+    const shortSide = areaOf(band * perBand + 2);
+    expect(longSide).toBeGreaterThan(0);
+    expect(shortSide).toBeGreaterThan(0);
+    expect(Math.abs(longSide - shortSide)).toBeGreaterThan(1);
+  });
+
+  it('drops the cells the cutter cannot enter instead of drawing them', () => {
+    // A fine subdivision on this facet leaves cells smaller than the web that
+    // has to surround them — nothing is drawn, and the reason is on the list.
+    const crowded = build({ ...LIT, perfDensity: 8 });
+    expect(crowded.perfDropped).toBeGreaterThan(0);
+    expect(crowded.perfCells.reduce((count, facet) => count + facet.cells.length, 0))
+      .toBeLessThan(crowded.parameters.sides * crowded.parameters.rows * 2 * 64);
+    const said = getPlanterChecks(crowded, acp).map((check) => check.id);
+    expect(said.includes('perf-tool') || said.includes('perf-empty')).toBe(true);
+  });
+});
+
+describe('soil liner', () => {
+  it('arrives as two more parts, and only when it is asked for', () => {
+    expect(build().pieces.map((piece) => piece.id)).not.toContain('liner-wall');
+    const model = build(LIT);
+    expect(model.pieces.map((piece) => piece.id)).toEqual(['wall', 'base', 'rim', 'liner-wall', 'liner-base']);
+    expect(model.liner).not.toBeNull();
+  });
+
+  it('clears the wall by the cavity at every height', () => {
+    // On a straight-ringed pot the wall between two rings really is the
+    // straight line between them, so this measures the true gap rather than an
+    // estimate of it.
+    const cavity = 28;
+    const model = build({
+      style: 'prism', sides: 8, topDiameter: 420, bottomDiameter: 300, height: 520, rows: 2,
+      liner: true, cavity,
+    });
+    const liner = model.liner as NonNullable<PlanterModel['liner']>;
+    const { sides, rows } = model.parameters;
+
+    let tightest = Infinity;
+    for (let k = 0; k < rows; k += 1) {
+      for (let step = 0; step <= 20; step += 1) {
+        const u = step / 20;
+        const z = model.vertices[k][0].z + (model.vertices[k + 1][0].z - model.vertices[k][0].z) * u;
+        if (z > liner.height + 1e-6) continue;
+        const section = Array.from({ length: sides }, (_, i) => ({
+          x: model.vertices[k][i].x + (model.vertices[k + 1][i].x - model.vertices[k][i].x) * u,
+          y: model.vertices[k][i].y + (model.vertices[k + 1][i].y - model.vertices[k][i].y) * u,
+        }));
+        for (const corner of liner.section) {
+          expect(insideRing(corner, section)).toBe(true);
+          tightest = Math.min(tightest, toRing(corner, section));
+        }
+      }
+    }
+    // Sized to hit the target: looser wastes soil volume, tighter is a gap the
+    // strip and its wiring do not fit through.
+    expect(tightest).toBeGreaterThanOrEqual(cavity - 0.01);
+    expect(tightest).toBeLessThan(cavity + 1);
+  });
+
+  it('stops below the mouth so the collar covers the soil line', () => {
+    const model = build(LIT);
+    const liner = model.liner as NonNullable<PlanterModel['liner']>;
+    expect(liner.height).toBeLessThan(model.parameters.height);
+    expect(liner.height).toBeGreaterThan(model.parameters.height * 0.5);
+    expect(liner.mouthGap).toBeGreaterThanOrEqual(model.parameters.cavity - 0.01);
+  });
+
+  it('develops exactly, because it is a prism', () => {
+    const model = build(LIT);
+    const liner = model.liner as NonNullable<PlanterModel['liner']>;
+    const wall = model.pieces.find((piece) => piece.id === 'liner-wall') as PlanterPiece;
+    const corners = wall.folds.filter((fold) => fold.id.startsWith('liner-corner'));
+    expect(corners).toHaveLength(model.parameters.sides - 1);
+    for (const fold of corners) {
+      // A prism's corner creases all run the full height, all parallel.
+      expect(Math.hypot(fold.x2 - fold.x1, fold.y2 - fold.y1)).toBeCloseTo(liner.height, 6);
+      expect(fold.x1).toBeCloseTo(fold.x2, 6);
+    }
+    // The blank is exactly as long as the box is round.
+    const perimeter = liner.section.reduce((sum, point, i) => {
+      const next = liner.section[(i + 1) % liner.section.length];
+      return sum + Math.hypot(next.x - point.x, next.y - point.y);
+    }, 0);
+    expect(Math.max(...corners.map((fold) => fold.x1))).toBeLessThan(perimeter);
+  });
+
+  it('drills both floors so the cavity never becomes the sump', () => {
+    const model = build(LIT);
+    expect(model.pieces.find((piece) => piece.id === 'liner-base')?.holes.length).toBeGreaterThan(0);
+    expect(model.pieces.find((piece) => piece.id === 'base')?.holes.length).toBeGreaterThan(0);
+    // Nothing is drilled into a pot that is planted directly.
+    expect(build().pieces.find((piece) => piece.id === 'base')?.holes).toEqual([]);
+    for (const id of ['base', 'liner-base']) {
+      const piece = model.pieces.find((item) => item.id === id) as PlanterPiece;
+      for (const hole of piece.holes) {
+        for (const point of hole) expect(insideRing(point, piece.outline)).toBe(true);
+      }
+    }
+  });
+
+  it('quotes the box the soil actually goes in, not the shell around it', () => {
+    const model = build(LIT);
+    const liner = model.liner as NonNullable<PlanterModel['liner']>;
+    expect(liner.litres).toBeLessThan(planterVolumeLitres(model));
+    expect(getPlanterStats(model, acp).volume).toBe(`≈ ${liner.litres.toFixed(1)} L`);
+    expect(getPlanterStats(build(), acp).volume).toBe(`≈ ${planterVolumeLitres(build()).toFixed(1)} L`);
+  });
+
+  it('says there is no room rather than building a box that will not go in', () => {
+    const model = build({ sides: 6, topDiameter: 160, bottomDiameter: 150, height: 300, liner: true, cavity: 120 });
+    expect(model.liner).toBeNull();
+    expect(model.pieces.map((piece) => piece.id)).not.toContain('liner-wall');
+    expect(getPlanterChecks(model, acp).find((check) => check.id === 'liner-fit')?.severity).toBe('error');
+  });
+});
+
+describe('solar panel', () => {
+  it('cuts a window in the collar that stays inside the collar band', () => {
+    const model = build(LIT);
+    const rim = model.pieces.find((piece) => piece.id === 'rim') as PlanterPiece;
+    expect(rim.holes).toHaveLength(2);
+    const [opening, window] = rim.holes;
+    for (const point of window) {
+      expect(insideRing(point, rim.outline)).toBe(true);
+      // Clear of the planting hole, or the panel overhangs into it.
+      expect(insideRing(point, opening)).toBe(false);
+    }
+    // Cut under the panel's own size, so the panel beds onto a lip.
+    const span = Math.max(...window.map(
+      (a) => Math.max(...window.map((b) => Math.hypot(a.x - b.x, a.y - b.y))),
+    ));
+    expect(span).toBeLessThan(Math.hypot(model.parameters.solarWidth, model.parameters.solarLength));
+  });
+
+  it('cuts nothing when the collar cannot carry the panel, and says why', () => {
+    const model = build({ ...LIT, rimWidth: 30 });
+    expect(model.pieces.find((piece) => piece.id === 'rim')?.holes).toHaveLength(1);
+    const check = getPlanterChecks(model, acp).find((item) => item.id === 'solar-fit');
+    expect(check?.severity).toBe('warning');
+    expect(check?.detail).toContain('86 mm');
+  });
+
+  it('leaves the collar alone when no panel was asked for', () => {
+    expect(build({ ...LIT, solar: false }).pieces.find((piece) => piece.id === 'rim')?.holes).toHaveLength(1);
+  });
+});
+
+describe('LED strip', () => {
+  const ids = (model: PlanterModel) => getPlanterChecks(model, acp).map((check) => check.id);
+
+  it('leaves a design that never asked for a strip completely alone', () => {
+    const plain = build();
+    expect(plain.parameters.led).toBe('none');
+    expect(plain.lighting).toBeNull();
+    const stats = getPlanterStats(plain, acp);
+    expect(stats.lighting).toBeUndefined();
+    expect(stats.power).toBeUndefined();
+    expect(stats.runtime).toBeUndefined();
+    expect(ids(plain).some((id) => id.startsWith('led-'))).toBe(false);
+  });
+
+  it('measures the run off the liner it is stuck to, not off the pot', () => {
+    const model = build({ ...LIT, led: '3000k' });
+    const light = model.lighting!;
+    const liner = model.liner!;
+    const round = liner.section.reduce(
+      (sum, point, i, all) => sum + Math.hypot(all[(i + 1) % all.length].x - point.x, all[(i + 1) % all.length].y - point.y),
+      0,
+    );
+    expect(light.length).toBeCloseTo(round, 6);
+    // And the count follows the strip that was actually specified.
+    expect(light.leds).toBe(Math.round((light.length / 1000) * 60));
+  });
+
+  it('adds a run without lengthening the pot', () => {
+    const one = build({ ...LIT, led: '3000k', ledRuns: 1 }).lighting!;
+    const three = build({ ...LIT, led: '3000k', ledRuns: 3 }).lighting!;
+    expect(three.length).toBeCloseTo(one.length * 3, 6);
+    expect(three.leds).toBe(one.leds * 3);
+    expect(three.peakWatts).toBeCloseTo(one.peakWatts * 3, 6);
+  });
+
+  it('charges for density without moving the strip', () => {
+    const sparse = build({ ...LIT, led: '3000k', ledDensity: 30 }).lighting!;
+    const dense = build({ ...LIT, led: '3000k', ledDensity: 144 }).lighting!;
+    expect(dense.length).toBeCloseTo(sparse.length, 6);
+    expect(dense.leds).toBeGreaterThan(sparse.leds * 4);
+    expect(dense.peakWatts).toBeGreaterThan(sparse.peakWatts * 4);
+  });
+
+  it('keeps the three whites electrically identical and the addressable one not', () => {
+    const whites = (['3000k', '6000k', '10000k'] as const).map((led) => build({ ...LIT, led }).lighting!);
+    for (const white of whites) {
+      expect(white.volts).toBe(12);
+      expect(white.addressable).toBe(false);
+      expect(white.peakWatts).toBeCloseTo(whites[0].peakWatts, 9);
+      expect(white.feeds).toBe(1);
+    }
+    // What differs between them is the light, not the load.
+    expect(whites[0].kelvin).toBe(3000);
+    expect(whites[2].kelvin).toBe(10000);
+    expect(whites[1].lumens).toBeGreaterThan(whites[2].lumens);
+
+    const rgb = build({ ...LIT, led: 'ws2812' }).lighting!;
+    expect(rgb.volts).toBe(5);
+    expect(rgb.addressable).toBe(true);
+    // Three dice per pixel against one white one: a different animal on the
+    // same length of tape, which is the whole reason the budget is computed.
+    expect(rgb.peakWatts).toBeGreaterThan(whites[0].peakWatts * 3);
+    expect(rgb.amps).toBeGreaterThan(whites[0].amps * 3);
+  });
+
+  it('sizes the supply above the flat-out draw, never against the dimmed one', () => {
+    for (const led of ['3000k', 'ws2812'] as const) {
+      for (const ledRuns of [1, 4]) {
+        const light = build({ ...LIT, led, ledRuns, ledBrightness: 10 }).lighting!;
+        expect(light.supply).toBeGreaterThanOrEqual(light.peakWatts * 1.2);
+        expect(light.watts).toBeLessThan(light.peakWatts);
+        expect(light.amps).toBeCloseTo(light.peakWatts / light.volts, 9);
+      }
+    }
+  });
+
+  it('asks for more feed points as the run gets longer, and sooner at 5 V', () => {
+    const long = { ...LIT, ledRuns: 6, topDiameter: 900, bottomDiameter: 860, rimWidth: 120 };
+    const white = build({ ...long, led: '6000k' }).lighting!;
+    const rgb = build({ ...long, led: 'ws2812' }).lighting!;
+    expect(rgb.length).toBeCloseTo(white.length, 6);
+    expect(rgb.feeds).toBeGreaterThan(white.feeds);
+    expect(ids(build({ ...long, led: 'ws2812' }))).toContain('led-feed');
+    expect(ids(build({ ...long, led: 'ws2812' }))).toContain('led-data');
+  });
+
+  it('says so when the strip has no box to sit on and no way out', () => {
+    const naked = build({ ...LIT, led: '3000k', liner: false, perforation: 'none' });
+    expect(ids(naked)).toContain('led-liner');
+    expect(ids(naked)).toContain('led-dark');
+    // It still costs what it costs — the run is quoted off the wall instead.
+    expect(naked.lighting!.length).toBeGreaterThan(0);
+  });
+
+  it('knows a panel that was never cut brings in nothing', () => {
+    // The collar is too narrow for the panel, so no window was cut — and a
+    // panel that is not in the pot cannot charge it.
+    const model = build({ ...LIT, led: '3000k', rimWidth: 30 });
+    expect(model.pieces.find((piece) => piece.id === 'rim')?.holes).toHaveLength(1);
+    expect(model.lighting!.harvest).toBe(0);
+    expect(model.lighting!.runtime).toBe(0);
+    expect(ids(model)).toContain('led-mains');
+    expect(ids(model)).not.toContain('led-solar');
+  });
+
+  it('tells a pot it cannot run all night by how much, and what would fix it', () => {
+    const model = build({ ...LIT, led: 'ws2812', ledBrightness: 100, ledHours: 10 });
+    const light = model.lighting!;
+    expect(light.harvest).toBeGreaterThan(0);
+    expect(light.runtime).toBeLessThan(10);
+    const check = getPlanterChecks(model, acp).find((item) => item.id === 'led-solar');
+    expect(check?.severity).toBe('warning');
+    // The remedy is quoted as a bigger panel than the one fitted.
+    const bigger = /about (\d+) . (\d+) mm of panel/.exec(check?.detail ?? '');
+    expect(bigger).not.toBeNull();
+    expect(Number(bigger![1])).toBeGreaterThan(model.parameters.solarWidth);
+  });
+
+  it('turns the one-click pot down to what its own panel carries', () => {
+    const fitted = litPlanter({ ...DEFAULT_PLANTER });
+    expect(fitted.led).toBe('3000k');
+    const model = buildPlanterModel(fitted);
+    const light = model.lighting!;
+    expect(light.harvest).toBeGreaterThan(0);
+    expect(light.runtime).toBeGreaterThanOrEqual(fitted.ledHours - 0.05);
+    expect(getPlanterChecks(model, acp).filter((check) => check.id.startsWith('led-'))).toEqual([]);
+    // And it never claims more than the panel: this is a small panel on a collar.
+    expect(fitted.ledBrightness).toBeLessThan(100);
+  });
+
+  it('keeps a strip the caller already chose when the kit is refitted', () => {
+    expect(litPlanter({ ...DEFAULT_PLANTER, led: 'ws2812' }).led).toBe('ws2812');
+    expect(litPlanter({ ...DEFAULT_PLANTER, led: '10000k' }).led).toBe('10000k');
+  });
+
+  it('carries the strip into the shop notes and the stats, and off again', () => {
+    const model = build({ ...LIT, led: '6000k' });
+    const svg = buildPlanterSvg(model, acp, 'Test');
+    expect(svg).toContain('6000K daylight');
+    expect(svg).toContain('Supply 12 V');
+    const stats = getPlanterStats(model, acp);
+    expect(stats.lighting).toContain('6000K daylight');
+    expect(stats.power).toContain('at 12 V');
+    expect(stats.runtime).toContain('Wh/day');
+
+    const dark = build({ ...LIT, led: 'none' });
+    expect(buildPlanterSvg(dark, acp, 'Test')).not.toContain('Supply 12 V');
+    expect(getPlanterStats(dark, acp).power).toBeUndefined();
+  });
+
+  it('clamps every electrical lever to something orderable', () => {
+    const wild = normalizePlanter({
+      ...DEFAULT_PLANTER,
+      led: 'halogen' as never,
+      ledDensity: 47,
+      ledRuns: 99,
+      ledBrightness: Number.NaN,
+      ledHours: -3,
+    });
+    expect(wild.led).toBe('none');
+    // Strips are sold at 30, 60 and 144 a metre — 47 is not a strip.
+    expect(wild.ledDensity).toBe(60);
+    expect(wild.ledRuns).toBe(6);
+    expect(wild.ledBrightness).toBe(60);
+    // A magnitude, like every other size here: a minus sign is a typo, not a
+    // request for negative hours.
+    expect(wild.ledHours).toBe(3);
+    expect(normalizePlanter({ ...DEFAULT_PLANTER, ledHours: Number.NaN }).ledHours).toBe(6);
+    for (const led of ['3000k', '6000k', '10000k', 'ws2812'] as const) {
+      expect(normalizePlanter({ ...DEFAULT_PLANTER, led }).led).toBe(led);
+    }
+    expect(normalizePlanter({ ...DEFAULT_PLANTER, ledDensity: 120 }).ledDensity).toBe(144);
+    expect(normalizePlanter({ ...DEFAULT_PLANTER, ledDensity: 40 }).ledDensity).toBe(30);
+  });
+});
+
+describe('effect modes and where the strip sits', () => {
+  const ids = (model: PlanterModel) => getPlanterChecks(model, acp).map((check) => check.id);
+  const RGB = { ...LIT, led: 'ws2812' } as Partial<PlanterParameters>;
+
+  it('charges a mode for what it actually lights, and the driver for everything', () => {
+    const solid = build({ ...RGB, ledEffect: 'static' }).lighting!;
+    const comet = build({ ...RGB, ledEffect: 'comet' }).lighting!;
+
+    // The wiring, the fuse and the driver still have to survive white.
+    expect(comet.peakWatts).toBeCloseTo(solid.peakWatts, 9);
+    expect(comet.amps).toBeCloseTo(solid.amps, 9);
+    expect(comet.supply).toBe(solid.supply);
+    // The night is paid for by what is lit, and a comet lights very little.
+    expect(comet.watts).toBeLessThan(solid.watts * 0.25);
+    expect(comet.demand).toBeLessThan(solid.demand);
+    expect(comet.runtime).toBeGreaterThan(solid.runtime * 4);
+    expect(comet.duty).toBeCloseTo(getLedEffect('comet').duty, 9);
+  });
+
+  it('ignores the mode on a white strip, which has only one state', () => {
+    const warm = build({ ...LIT, led: '3000k', ledEffect: 'police' }).lighting!;
+    expect(warm.effect).toBe('static');
+    expect(warm.duty).toBe(1);
+  });
+
+  it('will not run a mode with nothing to drive it, and says so', () => {
+    const orphan = build({ ...RGB, ledEffect: 'rainbow', ledController: 'none' });
+    // Forced back to one colour, so the budget does not quietly assume a duty
+    // that this pot has no way of producing.
+    expect(orphan.lighting!.effect).toBe('static');
+    expect(orphan.lighting!.duty).toBe(1);
+    expect(ids(orphan)).toContain('led-controller');
+    expect(ids(build({ ...RGB, ledEffect: 'rainbow', ledController: 'wled' }))).not.toContain('led-controller');
+    // A controller is only wasted on a strip that has no pixels to address.
+    expect(ids(build({ ...LIT, led: '6000k', ledController: 'none' }))).not.toContain('led-controller');
+  });
+
+  it('measures a different circuit for each mounting', () => {
+    const tapered = { ...RGB, topDiameter: 520, bottomDiameter: 300, rimWidth: 60 };
+    const rim = build({ ...tapered, ledPosition: 'rim' }).lighting!;
+    const wall = build({ ...tapered, ledPosition: 'wall' }).lighting!;
+    const foot = build({ ...tapered, ledPosition: 'foot' }).lighting!;
+
+    // Three sections of the same pot, and on a taper they are not close.
+    expect(rim.position).toBe('rim');
+    expect(rim.length).toBeGreaterThan(foot.length * 1.1);
+    expect(new Set([rim.length, wall.length, foot.length]).size).toBe(3);
+    // More strip is more pixels is more current — the budget follows the run.
+    expect(rim.leds).toBeGreaterThan(foot.leds);
+    expect(rim.peakWatts).toBeGreaterThan(foot.peakWatts);
+  });
+
+  it('warns that the bottom mounting is where the water goes, and only that one', () => {
+    expect(ids(build({ ...RGB, ledPosition: 'foot' }))).toContain('led-wet');
+    expect(ids(build({ ...RGB, ledPosition: 'rim' }))).not.toContain('led-wet');
+    expect(ids(build({ ...RGB, ledPosition: 'wall' }))).not.toContain('led-wet');
+  });
+
+  it('tells the workshop where to stick it and what to load on the controller', () => {
+    const notes = buildPlanterSvg(
+      build({ ...RGB, ledPosition: 'rim', ledEffect: 'comet', ledController: 'wled' }), acp, 'Test',
+    );
+    expect(notes).toContain('under the collar, facing down');
+    expect(notes).toContain('WLED controller');
+    expect(notes).toContain('Comet');
+
+    const plain = buildPlanterSvg(build({ ...RGB, ledEffect: 'static' }), acp, 'Test');
+    expect(plain).toContain('on the liner face, facing the cut-outs');
+    expect(plain).not.toContain('Comet');
+  });
+
+  it('leaves no cut line touched by any of it', () => {
+    // The whole point: the mode is programmed at the bench, so twenty modes are
+    // twenty controllers and exactly one drawing.
+    const reference = buildPlanterDxf(build({ ...RGB, ledEffect: 'static' }));
+    for (const spec of LED_EFFECTS) {
+      for (const ledSpeed of [5, 100]) {
+        expect(buildPlanterDxf(build({ ...RGB, ledEffect: spec.id, ledSpeed }))).toBe(reference);
+      }
+    }
+    expect(buildPlanterDxf(build({ ...RGB, ledColor: '#ff0000' }))).toBe(reference);
+    // Where it is mounted does not cut anything either — it is a channel bonded
+    // in after the fact, not a feature in the sheet.
+    for (const ledPosition of ['rim', 'wall', 'foot'] as const) {
+      expect(buildPlanterDxf(build({ ...RGB, ledPosition }))).toBe(reference);
+    }
+  });
+
+  it('clamps the mode, the speed, the colour and the mounting', () => {
+    const wild = normalizePlanter({
+      ...DEFAULT_PLANTER,
+      ledEffect: 'disco' as never,
+      ledSpeed: Number.NaN,
+      ledColor: 'rebeccapurple' as never,
+      ledController: 'clapper' as never,
+      ledPosition: 'lid' as never,
+    });
+    expect(wild.ledEffect).toBe('static');
+    expect(wild.ledSpeed).toBe(50);
+    expect(wild.ledColor).toBe('#28d8ff');
+    expect(wild.ledController).toBe('wled');
+    expect(wild.ledPosition).toBe('wall');
+    expect(normalizePlanter({ ...DEFAULT_PLANTER, ledColor: '#AbC123' }).ledColor).toBe('#AbC123');
+    expect(normalizePlanter({ ...DEFAULT_PLANTER, ledSpeed: 900 }).ledSpeed).toBe(100);
+    for (const spec of LED_EFFECTS) {
+      expect(normalizePlanter({ ...DEFAULT_PLANTER, ledEffect: spec.id }).ledEffect).toBe(spec.id);
+    }
+  });
+});
+
+describe('lighting as a whole', () => {
+  it('ships lit presets that clear fabrication', () => {
+    const lit = PLANTER_PRESETS.filter((preset) => preset.category === 'lit');
+    expect(lit.length).toBeGreaterThanOrEqual(3);
+    for (const preset of lit) {
+      const model = build(preset.parameters);
+      expect(model.liner).not.toBeNull();
+      expect(model.perfCells.length).toBeGreaterThan(0);
+      expect(getPlanterChecks(model, acp).filter((check) => check.severity === 'error')).toEqual([]);
+      // The panel window actually got cut on every one of them.
+      expect(model.pieces.find((piece) => piece.id === 'rim')?.holes).toHaveLength(2);
+    }
+  });
+
+  it('clamps every lighting lever to something buildable', () => {
+    const wild = normalizePlanter({
+      ...DEFAULT_PLANTER,
+      perfDensity: 99, perfWeb: -400, perfMargin: Number.NaN, perfTool: 0, perfOpening: Number.NaN,
+      perfSkirt: -50, perfPicked: Number.NaN, perfFade: Number.NEGATIVE_INFINITY, perfLift: Number.NaN,
+      cavity: 1e9, solarWidth: 0, solarLength: Number.POSITIVE_INFINITY,
+    });
+    expect(wild.perfDensity).toBe(8);
+    expect(wild.perfWeb).toBe(60);
+    expect(wild.perfOpening).toBe(18);
+    expect(wild.perfPicked).toBe(0);
+    expect(wild.perfLift).toBe(32);
+    expect(wild.perfFade).toBe(0);
+    expect(normalizePlanter({ ...DEFAULT_PLANTER, perforation: 'chevrons' as never }).perforation).toBe('none');
+    for (const family of ['triangles', 'shards', 'dots', 'grid', 'foldout'] as const) {
+      expect(normalizePlanter({ ...DEFAULT_PLANTER, perforation: family }).perforation).toBe(family);
+    }
+    // Non-finite falls back to the default rather than to the floor, or a design
+    // saved before these existed would arrive with a 5 mm border beside a fold.
+    expect(wild.perfMargin).toBe(22);
+    expect(wild.perfTool).toBe(1);
+    expect(wild.perfSkirt).toBe(50);
+    expect(wild.cavity).toBe(200);
+    expect(wild.solarWidth).toBe(30);
+    expect(wild.solarLength).toBe(70);
+  });
+
+  it('survives the lighting corners without producing NaN geometry', () => {
+    const corners: Partial<PlanterParameters>[] = [
+      { ...LIT, sides: 3, rows: 1, perfDensity: 8 },
+      { ...LIT, sides: 12, rows: 8, perfDensity: 1, perfSkirt: 0 },
+      { ...LIT, footprint: 'rectangle', topWidth: 60, topLength: 4000 },
+      { ...LIT, construction: 'banded', bulge: 60, rows: 8 },
+      { ...LIT, perfTool: 20, perfWeb: 60, perfMargin: 120 },
+      { ...LIT, height: 60, topDiameter: 60, bottomDiameter: 60, cavity: 6 },
+      { ...LIT, twist: 180, bulge: -45, construction: 'banded' },
+    ];
+    for (const corner of corners) {
+      const model = build(corner);
+      const cells = model.perfCells.flatMap((facet) => facet.cells).flat();
+      expect(cells.every((point) => Number.isFinite(point.x) && Number.isFinite(point.y))).toBe(true);
+      expect(buildPlanterDxf(model)).not.toMatch(/NaN/);
+      expect(buildPlanterSvg(model, acp, 'corner')).not.toMatch(/NaN/);
+      for (const check of getPlanterChecks(model, acp)) expect(check.detail).not.toMatch(/NaN|undefined/);
+      if (model.liner) {
+        expect(Number.isFinite(model.liner.litres)).toBe(true);
+        expect(model.liner.inradius).toBeGreaterThan(0);
+      }
+    }
+  });
+});
+
+describe('stone cladding', () => {
+  const ids = (model: PlanterModel) => getPlanterChecks(model, acp).map((check) => check.id);
+  const JERUSALEM = 'yellow_stone_wall';
+
+  it('leaves a design that never asked for stone completely alone', () => {
+    const plain = build();
+    expect(plain.parameters.stone).toBe('none');
+    expect(plain.stone).toBeNull();
+    const stats = getPlanterStats(plain, acp);
+    expect(stats.stone).toBeUndefined();
+    expect(stats.coat).toBeUndefined();
+    expect(ids(plain).some((id) => id.startsWith('stone-'))).toBe(false);
+    expect(buildPlanterSvg(plain, acp, 'Diamond')).not.toContain('PAINT');
+  });
+
+  /**
+   * The one that matters.
+   *
+   * The pot is folded before anybody opens a tin, so the file the cutter gets
+   * cannot possibly depend on what the pot is painted. If this ever fails, the
+   * studio has started sending the workshop a different part over a finish.
+   */
+  it('never moves a cut line, whatever is painted on it', () => {
+    const base = { ...DEFAULT_PLANTER, perforation: 'triangles', liner: true } as Partial<PlanterParameters>;
+    const reference = buildPlanterDxf(build(base));
+
+    for (const stone of STONE_MATERIALS) {
+      expect(buildPlanterDxf(build({ ...base, stone: stone.id })), stone.id).toBe(reference);
+    }
+    for (let stoneCoat = 0; stoneCoat <= MAX_COAT_MM; stoneCoat += 0.5) {
+      expect(buildPlanterDxf(build({ ...base, stone: JERUSALEM, stoneCoat })), String(stoneCoat)).toBe(reference);
+    }
+    for (const stoneSeal of STONE_SEALS) {
+      expect(buildPlanterDxf(build({ ...base, stone: JERUSALEM, stoneSeal })), stoneSeal).toBe(reference);
+    }
+    for (const stoneRelief of [0, 100]) {
+      for (const stoneTone of [0, 100]) {
+        expect(buildPlanterDxf(build({
+          ...base, stone: JERUSALEM, stoneRelief, stoneTone, stoneTint: '#c3cdd6',
+        }))).toBe(reference);
+      }
+    }
+  });
+
+  it('measures the coat off the pot it is actually painting', () => {
+    const coat = build({ stone: JERUSALEM, stoneCoat: 6 }).stone!;
+    expect(coat.code).toBe('ST124');
+    // Wall plus collar on a half-metre pot: a real fraction of a square metre.
+    expect(coat.areaM2).toBeGreaterThan(0.2);
+    expect(coat.areaM2).toBeLessThan(3);
+    expect(coat.litres).toBeCloseTo(coat.areaM2 * 6 * 0.6, 6);
+    expect(coat.kg).toBeCloseTo(coat.litres * 1.55, 6);
+    expect(coat.keepOut).toBe(6);
+    expect(coat.reliefRun).toBeGreaterThan(0);
+
+    // A bigger pot is more of everything. Nothing here is a fixed number.
+    const bigger = build({ stone: JERUSALEM, stoneCoat: 6, height: 900, topDiameter: 700 }).stone!;
+    expect(bigger.areaM2).toBeGreaterThan(coat.areaM2);
+    expect(bigger.kg).toBeGreaterThan(coat.kg);
+    expect(bigger.hours).toBeGreaterThan(coat.hours);
+  });
+
+  it('shows no more relief than the build pays for', () => {
+    expect(build({ stone: JERUSALEM, stoneCoat: 8, stoneRelief: 100 }).stone!.reliefMm).toBeCloseTo(8, 6);
+    expect(build({ stone: JERUSALEM, stoneCoat: 8, stoneRelief: 50 }).stone!.reliefMm).toBeCloseTo(4, 6);
+    expect(build({ stone: JERUSALEM, stoneCoat: 0, stoneRelief: 100 }).stone!.reliefMm).toBe(0);
+  });
+
+  it('holds the ten-millimetre ceiling whatever arrives', () => {
+    expect(normalizePlanter({ ...DEFAULT_PLANTER, stoneCoat: 40 }).stoneCoat).toBe(MAX_COAT_MM);
+    expect(normalizePlanter({ ...DEFAULT_PLANTER, stoneCoat: -4 }).stoneCoat).toBe(4);
+    expect(normalizePlanter({ ...DEFAULT_PLANTER, stoneCoat: Number.NaN }).stoneCoat).toBe(6);
+    expect(build({ stone: JERUSALEM, stoneCoat: 999 }).stone!.coatMm).toBe(MAX_COAT_MM);
+  });
+
+  it('opens a design saved against a stone the shop no longer keeps', () => {
+    const gone = build({ stone: 'granite_from_mars', stoneCoat: 5 });
+    expect(gone.parameters.stone).toBe('none');
+    expect(gone.stone).toBeNull();
+    expect(normalizePlanter({ ...DEFAULT_PLANTER, stoneSeal: 'lacquer' as never }).stoneSeal).toBe('matte');
+    expect(normalizePlanter({ ...DEFAULT_PLANTER, stoneTint: 'red' }).stoneTint).toBe('#ffffff');
+  });
+
+  it('says when the render has closed the holes the wall was cut for', () => {
+    const open = { ...DEFAULT_PLANTER, perforation: 'triangles', liner: true, stone: JERUSALEM } as Partial<PlanterParameters>;
+    const thin = build({ ...open, stoneCoat: 1 });
+    const thick = build({ ...open, stoneCoat: MAX_COAT_MM });
+
+    expect(thin.stone!.throat).toBeGreaterThan(0);
+    expect(thick.stone!.throat).toBeLessThan(thin.stone!.throat);
+    expect(ids(thick)).toContain('stone-perf');
+    const shut = getPlanterChecks(thick, acp).find((check) => check.id === 'stone-perf')!;
+    expect(shut.severity).toBe(thick.stone!.throat <= 0 ? 'error' : 'warning');
+    // A solid wall has no openings to lose, so the check has nothing to say.
+    expect(ids(build({ stone: JERUSALEM, stoneCoat: MAX_COAT_MM }))).not.toContain('stone-perf');
+  });
+
+  it('weighs the coat against the panel carrying it', () => {
+    expect(ids(build({ stone: JERUSALEM, stoneCoat: 1 }))).not.toContain('stone-weight');
+    const heavy = build({ stone: JERUSALEM, stoneCoat: MAX_COAT_MM });
+    expect(ids(heavy)).toContain('stone-weight');
+    expect(getPlanterChecks(heavy, acp).find((check) => check.id === 'stone-weight')!.title)
+      .toContain(heavy.stone!.kg.toFixed(1));
+  });
+
+  it('warns about the creases only once there is enough render to crack', () => {
+    expect(ids(build({ stone: JERUSALEM, stoneCoat: 1 }))).not.toContain('stone-crease');
+    expect(ids(build({ stone: JERUSALEM, stoneCoat: 6 }))).toContain('stone-crease');
+  });
+
+  it('sends the painter a card the cutter never sees', () => {
+    const svg = buildPlanterSvg(build({ stone: JERUSALEM, stoneCoat: 6, stoneSeal: 'satin' }), acp, 'Diamond');
+    expect(svg).toContain('PAINT');
+    expect(svg).toContain('ST124');
+    expect(svg).toContain('Jerusalem Gold');
+    expect(svg).toContain('satin sealer');
+    // And it carries the part nobody can specify: the glaze belongs to whoever
+    // painted it, and two pots are never the same.
+    expect(svg).toContain('no two pots match');
+  });
+
+  it('reports the stone and what painting it costs, in the stats', () => {
+    const stats = getPlanterStats(build({ stone: JERUSALEM, stoneCoat: 6 }), acp);
+    expect(stats.stone).toContain('ST124');
+    expect(stats.stone).toContain('6 mm');
+    expect(stats.coat).toMatch(/coats · [\d.]+ L · [\d.]+ kg · [\d.]+ h · \d+ days?/);
+  });
+
+  it('says every one of its warnings in Hebrew too', () => {
+    const model = build({
+      ...DEFAULT_PLANTER, perforation: 'triangles', liner: true, led: '3000k',
+      stone: JERUSALEM, stoneCoat: MAX_COAT_MM,
+    });
+    const english = getPlanterChecks(model, acp).filter((check) => check.id.startsWith('stone-'));
+    expect(english.length).toBeGreaterThan(2);
+    const hebrew = checksHe(english, model, acp);
+    for (const [i, check] of hebrew.entries()) {
+      expect(check.title, check.id).not.toBe(english[i].title);
+      expect(check.detail, check.id).not.toBe(english[i].detail);
+      expect(/[֐-׿]/.test(check.title), check.id).toBe(true);
+      expect(/[֐-׿]/.test(check.detail), check.id).toBe(true);
+    }
+    // And every stone on the shelf has a Hebrew name to show under its chip.
+    for (const stone of STONE_MATERIALS) expect(STONE_HE[stone.id], stone.id).toBeTruthy();
+  });
+});
+
+describe('direct UV printing', () => {
+  const ids = (model: PlanterModel) => getPlanterChecks(model, acp).map((check) => check.id);
+  const printed: Partial<PlanterParameters> = { print: 'triangles', printPalette: 'carnival' };
+
+  it('leaves a design that never asked to be printed completely alone', () => {
+    const plain = build();
+    expect(plain.parameters.print).toBe('none');
+    expect(plain.print).toBeNull();
+    const stats = getPlanterStats(plain, acp);
+    expect(stats.print).toBeUndefined();
+    expect(stats.ink).toBeUndefined();
+    expect(ids(plain).some((id) => id.startsWith('print-'))).toBe(false);
+    expect(buildPlanterSvg(plain, acp, 'Diamond')).not.toContain('PRINT — direct UV');
+  });
+
+  it('cuts the same file whatever is printed on it', () => {
+    // The mill is finished with the panel before the bed has seen it. This is
+    // the same promise the stone finish makes, and it is the reason a print can
+    // be specified this late at all.
+    const base = { ...DEFAULT_PLANTER, perforation: 'triangles', liner: true } as PlanterParameters;
+    const reference = buildPlanterDxf(build(base));
+
+    for (const printRule of PRINT_RULES) {
+      expect(buildPlanterDxf(build({ ...base, ...printed, printRule })), printRule).toBe(reference);
+    }
+    for (const printPalette of [...PRINT_PALETTES.map((p) => p.id), CUSTOM_PALETTE]) {
+      expect(buildPlanterDxf(build({ ...base, ...printed, printPalette })), printPalette).toBe(reference);
+    }
+    for (let printGrout = 0; printGrout <= MAX_GROUT; printGrout += 0.5) {
+      expect(buildPlanterDxf(build({ ...base, ...printed, printGrout })), String(printGrout)).toBe(reference);
+    }
+    for (const printSeed of [0, 1, 7, 999]) {
+      expect(buildPlanterDxf(build({ ...base, ...printed, printSeed })), String(printSeed)).toBe(reference);
+    }
+    for (const printTones of [2, 4, 6]) {
+      for (const printShade of [0, 100]) {
+        expect(buildPlanterDxf(build({ ...base, ...printed, printTones, printShade }))).toBe(reference);
+      }
+    }
+    expect(buildPlanterDxf(build({ ...base, print: 'image', printOverlay: false }))).toBe(reference);
+  });
+
+  it('gives every facet exactly one colour, in the model’s own order', () => {
+    const model = build({ ...printed, sides: 8, rows: 3 });
+    expect(model.print!.fills).toHaveLength(model.triangles.length);
+    for (const hex of model.print!.fills) expect(hex).toMatch(/^#[0-9a-f]{6}$/);
+    expect(model.print!.colours).toBe(new Set(model.print!.fills).size);
+    // Flat by default, like the catalogue pot: the palette's tones and nothing
+    // between them. Shading is relief added on request, and it is the one
+    // lever that turns four colours into forty on the print card.
+    expect(model.print!.colours).toBeLessThanOrEqual(model.parameters.printTones);
+    expect(build({ ...printed, printShade: 60 }).print!.colours)
+      .toBeGreaterThan(model.parameters.printTones);
+  });
+
+  it('holds the ink off the creases, and charges the area for it', () => {
+    const tight = build({ ...printed, printGrout: 0 });
+    const wide = build({ ...printed, printGrout: 6 });
+    expect(tight.print!.areaM2).toBeGreaterThan(wide.print!.areaM2);
+    // The facets themselves do not change — only how much of them is inked.
+    expect(tight.print!.facetM2).toBeCloseTo(wide.print!.facetM2, 6);
+    expect(wide.print!.groutRun).toBeGreaterThan(0);
+    expect(wide.print!.areaM2).toBeLessThan(wide.print!.facetM2);
+  });
+
+  it('takes the milled openings out of the inked area', () => {
+    const solid = build({ ...printed, perforation: 'none' });
+    const open = build({ ...printed, perforation: 'triangles', perfDensity: 3, liner: true });
+    expect(open.perfCells.length).toBeGreaterThan(0);
+    expect(open.print!.areaM2).toBeLessThan(solid.print!.areaM2);
+  });
+
+  it('bounds every lever a saved design can arrive with', () => {
+    const wild = normalizePlanter({
+      ...DEFAULT_PLANTER,
+      print: 'spray-can' as never,
+      printPalette: 'palette_from_mars',
+      printRule: 'airbrush' as never,
+      printSeed: Number.NaN,
+      printTones: 99,
+      printShade: -40,
+      printGrout: 999,
+      printColors: ['#ff0000', 'not a colour'],
+      printImage: 'javascript:alert(1)',
+      printFit: 'squash' as never,
+      printOverlayInk: 'white',
+      printOverlayDensity: 400,
+    });
+    expect(wild.print).toBe('none');
+    expect(wild.printPalette).toBe(PRINT_PALETTES[0].id);
+    expect(wild.printRule).toBe('scatter');
+    expect(wild.printSeed).toBe(1);
+    expect(wild.printTones).toBe(MAX_PRINT_TONES);
+    // Negatives are folded rather than floored, as everywhere else here: a
+    // slider that arrives at -40 meant 40 of something.
+    expect(wild.printShade).toBe(40);
+    expect(wild.printGrout).toBe(MAX_GROUT);
+    expect(wild.printColors).toHaveLength(6);
+    expect(wild.printColors[0]).toBe('#ff0000');
+    expect(wild.printColors[1]).toBe(DEFAULT_PRINT_COLOURS[1]);
+    // Anything that is not a PNG or a JPEG data URL is not artwork, and this
+    // string ends up inside a file the shop is handed.
+    expect(wild.printImage).toBe('');
+    expect(wild.printFit).toBe('cover');
+    expect(wild.printOverlayInk).toBe('#ffffff');
+    expect(wild.printOverlayDensity).toBe(100);
+    expect(normalizePlanter({ ...DEFAULT_PLANTER, printImage: 'data:image/png;base64,AAAB' }).printImage)
+      .toBe('data:image/png;base64,AAAB');
+  });
+
+  it('writes a print file registered to the cut file', () => {
+    const model = build({ ...printed, sides: 8, printGrout: 2 });
+    const svg = buildPlanterPrintSvg(model, 'Diamond');
+    // Same sheet, same millimetres, same origin — that is what lets the
+    // operator register to the outline the mill has already cut.
+    expect(svg).toContain(`width="${model.sheet.width.toFixed(2)}mm"`);
+    expect(svg).toContain('PRINT — direct UV');
+    expect(svg).toContain('id="artwork"');
+    expect(svg).toContain('id="registration"');
+    // No background: white in this file is white ink, not paper.
+    expect(svg).not.toContain('fill="white"');
+    for (const hex of new Set(model.print!.fills)) expect(svg).toContain(`fill="${hex}"`);
+  });
+
+  it('masks the artwork out of every hole that was milled through it', () => {
+    const open = build({ ...printed, perforation: 'triangles', perfDensity: 3, liner: true });
+    const svg = buildPlanterPrintSvg(open, 'Diamond');
+    expect(svg).toContain('<mask id="panel"');
+    // One black knockout per cut-out, plus the collar's own holes.
+    const knockouts = (svg.match(/fill="#000000"/g) ?? []).length;
+    expect(knockouts).toBeGreaterThanOrEqual(open.perfCells.reduce((n, f) => n + f.cells.length, 0));
+  });
+
+  it('lands an imported image on the wall and nowhere else', () => {
+    const pixel = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUg==';
+    const model = build({ print: 'image', printImage: pixel, printFit: 'contain' });
+    const svg = buildPlanterPrintSvg(model, 'Diamond');
+    expect(svg).toContain('<image');
+    expect(svg).toContain(pixel);
+    expect(svg).toContain('preserveAspectRatio="xMidYMid meet"');
+    expect(svg).toContain('clip-path="url(#facets)"');
+    // A raster has no per-facet colour to quote, and guessing one would be a
+    // number the shop could not use.
+    expect(model.print!.fills).toHaveLength(0);
+    expect(model.print!.colours).toBe(0);
+  });
+
+  it('prints the drawing on the pot, carrying the pot’s own numbers', () => {
+    const model = build({ ...printed, printOverlay: true, printOverlayDensity: 100 });
+    const svg = buildPlanterPrintSvg(model, 'Diamond');
+    expect(svg).toContain('id="drafting"');
+    expect(svg).toContain('DXF.TLV');
+    // The callouts are measurements of this pot, not decoration: the mouth
+    // diameter on the drawing is the mouth diameter of the pot.
+    const mouth = Math.hypot(
+      model.vertices[model.parameters.rows][0].x, model.vertices[model.parameters.rows][0].y,
+    ) * 2;
+    expect(svg).toContain(`⌀${mouth.toFixed(0)}`);
+    expect(buildPlanterPrintSvg(build({ ...printed, printOverlay: false }), 'Diamond'))
+      .not.toContain('id="drafting"');
+  });
+
+  it('refuses to have the print buried under the render', () => {
+    const both = build({ ...printed, stone: 'yellow_stone_wall', stoneCoat: 6 });
+    const clash = getPlanterChecks(both, acp).find((check) => check.id === 'print-stone')!;
+    expect(clash).toBeTruthy();
+    expect(clash.severity).toBe('error');
+    expect(ids(build(printed))).not.toContain('print-stone');
+  });
+
+  it('will not let a printed panel be folded hot without saying so', () => {
+    const model = build({ ...printed, sides: 4, rows: 1 });
+    expect(getPlanterChecks(model, getMaterial('acrylic-3')).map((c) => c.id)).toContain('print-heat');
+    expect(ids(model)).not.toContain('print-heat');
+  });
+
+  it('says when the nest will not go on the bed in one pass', () => {
+    const big = build({
+      ...printed, sides: 12, rows: 4, topDiameter: 900, bottomDiameter: 800, height: 1200,
+      sheetWidth: 3000, sheetHeight: 3000,
+    });
+    expect(big.print!.tiles).toBeGreaterThan(1);
+    expect(ids(big)).toContain('print-bed');
+    expect(ids(build(printed))).not.toContain('print-bed');
+  });
+
+  it('says when ink is being carried straight over a fold', () => {
+    expect(ids(build({ ...printed, printGrout: 0 }))).toContain('print-grout');
+    expect(ids(build({ ...printed, printGrout: DEFAULT_GROUT }))).not.toContain('print-grout');
+  });
+
+  it('says when there is no image to print', () => {
+    expect(ids(build({ print: 'image', printImage: '' }))).toContain('print-image');
+  });
+
+  it('reports the artwork and what printing it costs, in the stats', () => {
+    const stats = getPlanterStats(build({ ...printed, printRule: 'ramp' }), acp);
+    expect(stats.print).toContain('Carnival');
+    expect(stats.print).toContain('Gradient');
+    expect(stats.ink).toMatch(/\d passes? · [\d.]+ m2 · \d+ ml · \d+ min/);
+  });
+
+  it('says every one of its warnings in Hebrew too', () => {
+    const model = build({
+      ...printed, printGrout: 0, print: 'image', printImage: '',
+      stone: 'yellow_stone_wall', stoneCoat: 6, perforation: 'triangles', liner: true,
+    });
+    const english = getPlanterChecks(model, acp).filter((check) => check.id.startsWith('print-'));
+    expect(english.length).toBeGreaterThan(2);
+    const hebrew = checksHe(english, model, acp);
+    for (const [i, check] of hebrew.entries()) {
+      expect(check.title, check.id).not.toBe(english[i].title);
+      expect(check.detail, check.id).not.toBe(english[i].detail);
+      expect(/[֐-׿]/.test(check.title), check.id).toBe(true);
+      expect(/[֐-׿]/.test(check.detail), check.id).toBe(true);
     }
   });
 });

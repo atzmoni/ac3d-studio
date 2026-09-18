@@ -2,27 +2,42 @@
 
 import { ContactShadows, OrbitControls } from '@react-three/drei';
 import { Canvas, useFrame, useLoader } from '@react-three/fiber';
-import { Download, Maximize2, Pause, Play, RotateCcw, Rotate3D, Search, SlidersHorizontal } from 'lucide-react';
+import { Download, Image as ImageIcon, Lightbulb, Maximize2, Mountain, Pause, Play, Printer, RotateCcw, Rotate3D, Search, Shuffle, SlidersHorizontal } from 'lucide-react';
 import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import * as THREE from 'three';
 import { MTLLoader } from 'three/examples/jsm/loaders/MTLLoader.js';
 import { OBJLoader } from 'three/examples/jsm/loaders/OBJLoader.js';
-import { CheckList, NumberField, SliderField } from '@/components/controls';
+import { CheckList, NumberField, PatternPicker, SliderField, type PatternOption } from '@/components/controls';
+import { netUv, useArtworkTexture, wallNetBox, type ArtworkLook } from '@/components/planter-artwork';
+import { useStoneMaterial, type StoneLook } from '@/components/planter-stone-material';
 import { CameraRig, StudioLights } from '@/components/three-stage';
 import { buildFoldTree, cornersAt, internalEdges, type FoldTree } from '@/lib/fold-tree';
 import { getMaterial, MATERIALS } from '@/lib/pattern-engine';
+import { draftMarks } from '@/lib/planter-drafting';
 import {
-  buildPlanterDxf, buildPlanterModel, buildPlanterSvg, DEFAULT_PLANTER, FOLD_COLORS,
-  getPlanterChecks, getPlanterStats, placedGeometry,
+  buildPlanterDxf, buildPlanterModel, buildPlanterPrintSvg, buildPlanterSvg, collarColour,
+  DEFAULT_PLANTER, FOLD_COLORS, getPlanterChecks, getPlanterStats, isLitPlanter, LED_CONTROLLERS,
+  LED_DENSITIES, ledGlow, LED_POSITIONS, LEDS, litPlanter, placedGeometry, unlitPlanter,
 } from '@/lib/planter-engine';
+import { getLedEffect, hexToHsl, ledThrow, LED_BASE_COLOURS, LED_EFFECTS, pixelColor } from '@/lib/planter-led-effects';
+import { barycentric, flapSlit, type Triangle2 } from '@/lib/planter-perforation';
+import {
+  CUSTOM_PALETTE, insetTriangle, MAX_GROUT, MAX_PRINT_TONES, paletteColours, paletteName,
+  PRINT_FITS, PRINT_MODES, PRINT_PALETTES, PRINT_RULE_NAMES, PRINT_RULES,
+} from '@/lib/planter-print';
+import {
+  MAX_COAT_MM, SEAL_NAMES, stoneById, stoneName, STONE_FAMILIES, STONE_MATERIALS, STONE_SEALS,
+  STONE_TINTS,
+} from '@/lib/planter-stone';
 import {
   backdropById, finishById, gradientTexture, PLANTER_BACKDROPS, PLANTER_FINISHES,
   type PlanterBackdrop, type PlanterFinish,
 } from '@/lib/planter-finishes';
 import { BLANK_PLANTER, getPlanterStyle, PLANTER_CATEGORIES, PLANTER_PRESETS, PLANTER_STYLES } from '@/lib/planter-styles';
 import type {
-  FoldKind, MaterialId, PlanterCategory, PlanterConstruction, PlanterFootprint, PlanterModel,
-  PlanterParameters, PlanterPiece, PlanterStyleId, Vec2, Vec3,
+  FoldKind, MaterialId, PlanterCategory, PlanterConstruction, PlanterFootprint, PlanterLed,
+  PlanterLedController, PlanterLedPosition, PlanterModel, PlanterParameters, PlanterPerforation,
+  PlanterPiece, PlanterPrint, PlanterPrintFit, PlanterPrintRule, PlanterStyleId, Vec2, Vec3,
 } from '@/lib/types';
 
 type ViewAngle = 'iso' | 'front' | 'top' | 'hero';
@@ -40,6 +55,22 @@ const VIEW_LABELS: { id: ViewAngle; label: string }[] = [
 /** Longest dimension of the assembled pot, in world units. Everything else derives from this. */
 const POT_FIT = 3.4;
 
+/** What each print mode is called on the control. */
+const PRINT_MODE_LABELS: Record<string, string> = {
+  none: 'No print', triangles: 'Facet generator', image: 'Imported image',
+};
+
+/** The inks the drafting layer is kept in — white on a dark palette, and back. */
+const DRAFT_INKS = ['#ffffff', '#0d1220', '#d9c9a8', '#8fc2d8'];
+
+/**
+ * The most a supplied image may weigh.
+ *
+ * It is written whole into the exported print file, so this is not a memory
+ * limit — it is the size of the thing the shop has to open at the other end.
+ */
+const MAX_ARTWORK_BYTES = 12 * 1024 * 1024;
+
 const STROKE_DASH: Record<FoldKind, string | undefined> = {
   mountain: undefined, valley: '7 4', cut: '9 3 2 3',
 };
@@ -54,9 +85,43 @@ export interface StudioStatus {
 // 3D
 // ---------------------------------------------------------------------------
 
+/**
+ * The cut-out sizes, biggest opening first.
+ *
+ * Labelled by how big the holes come out, not by the subdivision underneath —
+ * the two run opposite ways, and "size" is the thing anybody actually has an
+ * opinion about. The full range stays on the slider below for the shop.
+ */
+const PERF_SIZES: PatternOption[] = [
+  { density: 0, label: 'Solid' },
+  { density: 1, label: 'Huge' },
+  { density: 2, label: 'Large' },
+  { density: 3, label: 'Medium' },
+  { density: 4, label: 'Small' },
+  { density: 6, label: 'Fine' },
+];
+
+/** The light coming through the wall, in the warm white these strips actually are. */
+
 interface ShellPiece {
   tree: FoldTree;
   crease: { tri: number; corners: [number, number] }[];
+  /** Where this piece's triangles start in the model's own triangle list. */
+  from: number;
+  /**
+   * Each triangle's corners in the developed net, as 0-1 across the wall's own
+   * box. Not a contrivance: the panel is printed flat, so the net is the
+   * artwork's own coordinate system, and these are the print file's
+   * millimetres normalised. See `planter-artwork.ts`.
+   */
+  uv: [number, number][][];
+  /**
+   * The wall's cut-outs, held as corner weights against the facet they sit on.
+   * A facet is rigid, so the same weights rebuild each cut-out at any stage of
+   * the fold — the pattern rides the wall up out of the flat net instead of
+   * being laid out again for every frame.
+   */
+  cut: { tri: number; cells: [number, number, number][][]; flaps: [number, number, number][][] }[];
 }
 
 /**
@@ -101,6 +166,33 @@ function usePlanterShell(model: PlanterModel) {
       return { x: s.x * scale, y: -s.y * scale, z: s.z * scale };
     };
 
+    // Cut-outs arrive in sheet coordinates, and so does `flatByBand` — so the
+    // weights are worked out there, in the one frame both are already in, and
+    // the shell's own scaling never has to touch them.
+    const sheetOf = (band: number, id: number): Vec2 =>
+      model.flatByBand[band][Math.floor(id / stride) - band][id % stride];
+    const cutByTriangle = new Map<number, {
+      cells: [number, number, number][][]; flaps: [number, number, number][][];
+    }>();
+    for (const facet of model.perfCells) {
+      const band = Math.floor(facet.triangle / (sides * 2));
+      const corners = model.triangles[facet.triangle].v.map((id) => sheetOf(band, id)) as Triangle2;
+      const weigh = (ring: Vec2[]) => ring.map((point) => barycentric(corners, point));
+      cutByTriangle.set(facet.triangle, { cells: facet.cells.map(weigh), flaps: facet.flaps.map(weigh) });
+    }
+    /** The cut-outs on one piece, indexed by the triangle's place within it. */
+    const cutsFor = (from: number, count: number) => Array.from({ length: count }, (_, j) => ({
+      tri: j,
+      cells: cutByTriangle.get(from + j)?.cells ?? [],
+      flaps: cutByTriangle.get(from + j)?.flaps ?? [],
+    })).filter((entry) => entry.cells.length > 0 || entry.flaps.length > 0);
+
+    // The artwork's frame. Worked out once, here, so the UVs on the mesh and
+    // the canvas the print is drawn into are laid out against the same box.
+    const netBox = wallNetBox(model);
+    const uvOf = (band: number, id: number): [number, number] =>
+      netUv(model.flatByBand[band][Math.floor(id / stride) - band][id % stride], netBox);
+
     const pieces: ShellPiece[] = [];
     if (banded) {
       // Single-sheet construction folds from one connected blank, so every band
@@ -126,7 +218,13 @@ function usePlanterShell(model: PlanterModel) {
           built: [builtOf(a), builtOf(b), builtOf(c)] as [Vec3, Vec3, Vec3],
         }));
         const tree = buildFoldTree(triangles, ids, { x: targetX, y: targetZ });
-        pieces.push({ tree, crease: internalEdges(ids) });
+        pieces.push({
+          tree,
+          crease: internalEdges(ids),
+          cut: cutsFor(band * sides * 2, sides * 2),
+          from: band * sides * 2,
+          uv: ids.map(([a, b, c]) => [uvOf(band, a), uvOf(band, b), uvOf(band, c)]),
+        });
       }
     } else {
       const ids = model.triangles.map((t) => t.v);
@@ -146,7 +244,13 @@ function usePlanterShell(model: PlanterModel) {
         y: flatPts.reduce((sum, p) => sum + p.y, 0) / flatPts.length,
       };
       const tree = buildFoldTree(triangles, ids, pivot);
-      pieces.push({ tree, crease: internalEdges(ids) });
+      pieces.push({
+        tree,
+        crease: internalEdges(ids),
+        cut: cutsFor(0, model.triangles.length),
+        from: 0,
+        uv: ids.map((tri) => tri.map((id) => uvOf(Math.min(Math.floor(id / stride), rows - 1), id)) as [number, number][]),
+      });
     }
 
     const shape = (points: { x: number; y: number }[], hole?: { x: number; y: number }[]) => {
@@ -235,8 +339,25 @@ function usePlanterShell(model: PlanterModel) {
       opening = Math.min(opening, drop);
     }
 
+    // The soil box, as the box it is: a prism standing on the pot's floor, with
+    // its own floor closed. Built from the liner's real section rather than a
+    // cylinder, so a rectangular pot gets a rectangular box.
+    let liner: THREE.BufferGeometry | null = null;
+    if (model.liner) {
+      const path = new THREE.Shape();
+      model.liner.section.forEach((point, i) => {
+        const x = point.x * scale;
+        const y = point.y * scale;
+        if (i === 0) path.moveTo(x, y); else path.lineTo(x, y);
+      });
+      path.closePath();
+      liner = new THREE.ExtrudeGeometry(path, { depth: model.liner.height * scale, bevelEnabled: false });
+      // Extrusion runs along +Z; a quarter turn stands it up on the floor.
+      liner.rotateX(-Math.PI / 2);
+    }
+
     return {
-      pieces, scale, base, rim,
+      pieces, scale, base, rim, liner,
       baseFlat: new THREE.Vector3(baseX, 0, alongZ),
       baseBuilt: new THREE.Vector3(0, 0.001, 0),
       rimFlat: new THREE.Vector3(rimX, 0, alongZ),
@@ -424,6 +545,76 @@ function Planting({ id, radius }: { id: PlantId; radius: number }) {
   );
 }
 
+/** What each strip is for, in one line. The kelvin number alone says nothing. */
+const LED_COPY: Record<PlanterLed, { short: string; note: string }> = {
+  none: { short: 'None', note: 'The cavity is left empty — lamp it later if you want to.' },
+  '3000k': { short: '3000K', note: 'The one a garden wants after dark: it lands warm on render, wood and planting, and it is the end of the range insects care least about. This is the default.' },
+  '6000k': { short: '6000K', note: 'Neutral white that holds colour honestly — right for a shopfront or for photography, too cold for somewhere people sit.' },
+  '10000k': { short: '10000K', note: 'The blue end. It reads as moonlight on metal and gives the least useful light per watt — an effect rather than a lamp.' },
+  ws2812: { short: 'WS2812', note: 'Not white at all: RGB with a controller in every LED, at 5 V. Each one is addressed on its own, so it can chase, wave or hold a colour per facet — and its power budget is a different animal.' },
+};
+
+/**
+ * The dot on each strip's button. The whites are the colour the preview glows
+ * at; the addressable one has no single colour, so it shows the whole wheel —
+ * which is also the honest answer to what it does.
+ */
+/** Where the strip goes, and what that costs you. */
+const LED_POSITION_COPY: Record<PlanterLedPosition, { name: string; note: string }> = {
+  rim: {
+    name: 'Top — under the collar',
+    note: 'The strip goes into a channel under the collar, facing down. It grazes the wall from above, so the upper cut-outs are the bright ones and they fade toward the foot — and it can be re-lamped from the top without lifting the soil box out.',
+  },
+  wall: {
+    name: 'On the box — facing the cut-outs',
+    note: 'Bonded to the outside face of the soil box, looking straight at the openings. The brightest of the three and the most even up the height — but it comes out with the box.',
+  },
+  foot: {
+    name: 'Bottom — facing up',
+    note: 'Standing on the base plate facing up, so the light washes the wall from below and the lower cut-outs are the strongest. It is also where the water ends up: IP65 tape, sealed joints and spacers over the drain holes.',
+  },
+};
+
+/** Best first: the one that actually runs these modes leads the row. */
+const LED_CONTROLLER_ORDER: PlanterLedController[] = ['wled', 'ir', 'none'];
+
+const ledSwatch = (led: PlanterLed): React.CSSProperties => (led === 'ws2812'
+  ? { background: 'conic-gradient(from 0deg, #ff5555, #ffd24d, #4dff88, #4dd2ff, #b46bff, #ff5555)', boxShadow: '0 0 8px rgba(122,216,255,0.75)' }
+  : { background: ledGlow(led), boxShadow: `0 0 8px ${ledGlow(led)}` });
+
+
+/**
+ * The pot's skin.
+ *
+ * One material for the wall, the petals, the base and the collar, because a
+ * hand-applied render does not stop at a part boundary — the painter works the
+ * assembled pot. Without a stone picked this falls back to the flat finish,
+ * where the collar and base do read a shade darker than the wall.
+ */
+function Skin({ stone, print, color, finish, flat = true }: {
+  stone: THREE.MeshStandardMaterial | null; color: string; finish: PlanterFinish; flat?: boolean;
+  /** Set on a printed wall: the fills arrive per vertex, so the material only
+   *  has to stop tinting them a second time. */
+  print?: { roughness: number } | null;
+}) {
+  if (stone) return <primitive object={stone} attach="material" />;
+  if (print) {
+    return (
+      <meshStandardMaterial
+        key="printed"
+        color="#ffffff" vertexColors metalness={0} roughness={print.roughness}
+        side={THREE.DoubleSide} flatShading={flat}
+      />
+    );
+  }
+  return (
+    <meshStandardMaterial
+      color={color} metalness={finish.metalness} roughness={finish.roughness}
+      side={THREE.DoubleSide} flatShading={flat}
+    />
+  );
+}
+
 function PlanterMesh({ model, finish, customColor, plant, assembly, autoRotate }: {
   model: PlanterModel; finish: PlanterFinish; customColor: string; plant: PlantId; assembly: number;
   autoRotate: React.MutableRefObject<boolean>;
@@ -435,54 +626,305 @@ function PlanterMesh({ model, finish, customColor, plant, assembly, autoRotate }
   // A shade darker, so the base plate and collar read as separate parts from
   // the wall rather than melting into one flat-coloured shape.
   const accentColor = useMemo(() => `#${new THREE.Color(wallColor).multiplyScalar(0.86).getHexString()}`, [wallColor]);
+  // What comes through the openings. The three whites are one colour each; an
+  // addressable strip has no single colour at all, so the mesh carries its own
+  // per-facet tint and the material only has to stop tinting it a second time.
+  const addressable = model.parameters.led === 'ws2812';
+  const lightColor = addressable ? '#ffffff' : ledGlow(model.parameters.led);
+  // The mode as the model resolved it, not as the toolbar shows it: a strip
+  // with no controller is held at one colour whatever was picked, and the
+  // preview has to agree with the power budget about that.
+  const effect = model.lighting?.effect ?? 'static';
+  const baseHsl = useMemo(() => hexToHsl(model.parameters.ledColor), [model.parameters.ledColor]);
+  // Each mode has a speed it wants to run at; the slider scales that rather
+  // than replacing it, so a strobe stays a strobe and a breath stays a breath.
+  const tempo = getLedEffect(effect).tempo * (0.25 + (model.parameters.ledSpeed / 100) * 1.75);
+  const phase = useRef(0);
+  // Where the strip sits decides which openings are the bright ones, and that
+  // is the whole visible difference between the three mountings.
+  const position = model.parameters.ledPosition;
+  // The stone, if one is painted on. `reliefMm` comes from the engine rather
+  // than from the slider, so the preview can never show deeper relief than the
+  // coat the shop was told to build.
+  const stoneLook = useMemo<StoneLook | null>(() => {
+    const picked = stoneById(model.parameters.stone);
+    if (!picked) return null;
+    return {
+      stone: picked,
+      scale: shell.scale,
+      reliefMm: model.stone?.reliefMm ?? 0,
+      toneVariation: model.parameters.stoneTone / 100,
+      tint: model.parameters.stoneTint,
+      seal: model.parameters.stoneSeal,
+    };
+  }, [model, shell.scale]);
+  const stoneSkin = useStoneMaterial(stoneLook);
 
-  const { wall, creases } = useMemo(() => {
+
+  // The print. `fills` is the engine's own array, in triangle order, so the pot
+  // on screen is painted from exactly what the print file fills — there is no
+  // second opinion about which colour lands on which facet.
+  const fills = model.print?.fills ?? [];
+  const artwork = useArtworkTexture(useMemo<ArtworkLook | null>(() => {
+    if (!model.print) return null;
+    const p = model.parameters;
+    const weight = Math.max(0.3, p.printGrout * 0.4);
+    const marks = p.printOverlay && p.printOverlayDensity > 0
+      ? draftMarks(model, { density: p.printOverlayDensity / 100, seed: p.printSeed, weight })
+      : [];
+    return {
+      image: p.print === 'image' ? p.printImage : '',
+      fit: p.printFit,
+      marks,
+      ink: p.printOverlayInk,
+      weight,
+      box: wallNetBox(model),
+    };
+  }, [model]));
+
+  const { wall, creases, cutouts, petals, pixelU, pixelV, tinted } = useMemo(() => {
     const pos: number[] = [];
+    const uvs: number[] = [];
+    const paint: number[] = [];
     const creaseData: number[] = [];
+    const cutData: number[] = [];
+    // Where each cut-out sits on the pot, one entry per vertex: `cutU` the way
+    // round it and `cutY` the height it is at, still in world units. An
+    // addressable mode is a function of exactly those two and the time, so
+    // carrying them on the geometry is what lets the effect animate every frame
+    // without the pot being rebuilt underneath it.
+    const cutU: number[] = [];
+    const cutY: number[] = [];
+    const petalData: number[] = [];
+    // The petals only stand up once the pot does: they are bent by hand after
+    // the wall is folded, so they open over the last of the fold.
+    const lift = ((model.parameters.perfLift * Math.PI) / 180) * Math.max(0, Math.min(1, (t - 0.6) / 0.4));
+
     for (const piece of shell.pieces) {
       const corners = cornersAt(piece.tree, t).map((tri) => tri.map(toWorld));
-      for (const tri of corners) for (const p of tri) pos.push(p.x, p.y, p.z);
+      corners.forEach((tri, index) => {
+        for (const p of tri) pos.push(p.x, p.y, p.z);
+        // The net's own coordinates, carried up onto the folded pot with the
+        // facet they belong to — the print does not move when the pot closes.
+        for (const [u, v] of piece.uv[index] ?? []) uvs.push(u, v);
+        const hex = fills[piece.from + index];
+        if (hex) {
+          const colour = new THREE.Color(hex);
+          for (let corner = 0; corner < 3; corner += 1) paint.push(colour.r, colour.g, colour.b);
+        }
+      });
       for (const edge of piece.crease) {
         const a = corners[edge.tri][edge.corners[0]];
         const b = corners[edge.tri][edge.corners[1]];
         creaseData.push(a.x, a.y, a.z, b.x, b.y, b.z);
       }
+
+      for (const facet of piece.cut) {
+        const [a, b, c] = corners[facet.tri];
+        // Proud of the facet by a hair, along its own normal. The wall here is
+        // a solid skin rather than a skin with holes in it — what these panels
+        // show is the light arriving through the openings, which is what a lit
+        // pot actually looks like from outside — and without the offset they
+        // would fight the wall for the same depth.
+        const normal = new THREE.Vector3().subVectors(b, a).cross(new THREE.Vector3().subVectors(c, a))
+          .normalize().multiplyScalar(0.0035);
+        const at = ([u, v, w]: [number, number, number]) => ({
+          x: a.x * u + b.x * v + c.x * w + normal.x,
+          y: a.y * u + b.y * v + c.y * w + normal.y,
+          z: a.z * u + b.z * v + c.z * w + normal.z,
+        });
+        // One opening is one pixel of the effect, so it takes one position:
+        // splitting a cell's own triangles across the pattern would cut a
+        // cut-out in half down a line that is not there on the wall.
+        const place = (middle: { x: number; y: number; z: number }, times: number) => {
+          const round = Math.atan2(middle.z, middle.x) / (Math.PI * 2) + 0.5;
+          for (let i = 0; i < times * 3; i += 1) { cutU.push(round); cutY.push(middle.y); }
+        };
+        const middleOf = (corners3: [number, number, number][]) => at([
+          corners3.reduce((sum, point) => sum + point[0], 0) / corners3.length,
+          corners3.reduce((sum, point) => sum + point[1], 0) / corners3.length,
+          corners3.reduce((sum, point) => sum + point[2], 0) / corners3.length,
+        ]);
+
+        for (const cell of facet.cells) {
+          // A cell is convex, so a fan from its first corner triangulates it.
+          const first = at(cell[0]);
+          const fan = Math.max(0, cell.length - 2);
+          for (let i = 1; i + 1 < cell.length; i += 1) {
+            const second = at(cell[i]);
+            const third = at(cell[i + 1]);
+            cutData.push(first.x, first.y, first.z, second.x, second.y, second.z, third.x, third.y, third.z);
+          }
+          if (fan > 0) place(middleOf(cell), fan);
+        }
+
+        for (const flap of facet.flaps) {
+          // The opening the petal bends out of, lit from inside like any other.
+          const hingeA = at(flap[0]);
+          const hingeB = at(flap[1]);
+          const tip = at(flap[2]);
+          cutData.push(hingeA.x, hingeA.y, hingeA.z, hingeB.x, hingeB.y, hingeB.z, tip.x, tip.y, tip.z);
+          place(middleOf(flap), 1);
+
+          // And the petal itself, turned about its hinge — Rodrigues, with the
+          // sign chosen by which way it actually sends the tip. Guessing from
+          // the winding would be wrong on half the facets.
+          const axis = new THREE.Vector3(hingeB.x - hingeA.x, hingeB.y - hingeA.y, hingeB.z - hingeA.z).normalize();
+          const arm = new THREE.Vector3(tip.x - hingeA.x, tip.y - hingeA.y, tip.z - hingeA.z);
+          const out = new THREE.Vector3(normal.x, normal.y, normal.z);
+          const turn = (angle: number) => arm.clone().applyAxisAngle(axis, angle);
+          const away = turn(lift).sub(arm).dot(out) >= 0 ? lift : -lift;
+          const bent = turn(away).add(new THREE.Vector3(hingeA.x, hingeA.y, hingeA.z));
+          petalData.push(
+            hingeA.x, hingeA.y, hingeA.z,
+            hingeB.x, hingeB.y, hingeB.z,
+            bent.x, bent.y, bent.z,
+          );
+        }
+      }
     }
 
     const surface = new THREE.BufferGeometry();
     surface.setAttribute('position', new THREE.BufferAttribute(new Float32Array(pos), 3));
+    if (uvs.length * 3 === pos.length * 2) {
+      surface.setAttribute('uv', new THREE.BufferAttribute(new Float32Array(uvs), 2));
+    }
+    // Only when every facet got one: a partly painted wall would show the
+    // missing ones as black rather than as unprinted panel.
+    if (paint.length === pos.length) {
+      surface.setAttribute('color', new THREE.BufferAttribute(new Float32Array(paint), 3));
+    }
     surface.computeVertexNormals();
 
     const lines = new THREE.BufferGeometry();
     lines.setAttribute('position', new THREE.BufferAttribute(new Float32Array(creaseData), 3));
 
-    return { wall: surface, creases: lines };
-  }, [shell, t]);
+    // Height is only meaningful against the pot it is on, and the pot changes
+    // size as the assembly slider moves, so it is normalised here rather than
+    // against anything fixed.
+    const low = cutY.length > 0 ? Math.min(...cutY) : 0;
+    const high = cutY.length > 0 ? Math.max(...cutY) : 1;
+    const span = high - low > 1e-6 ? high - low : 1;
+    const pixelU = new Float32Array(cutU);
+    const pixelV = Float32Array.from(cutY, (y) => (y - low) / span);
+
+    const openings = new THREE.BufferGeometry();
+    openings.setAttribute('position', new THREE.BufferAttribute(new Float32Array(cutData), 3));
+    // Every strip is tinted per vertex, not only the addressable one: the
+    // mounting falloff is a gradient up the wall, and a material colour is one
+    // value for the whole mesh. For a white strip this bakes once and never
+    // moves; for an addressable one it is frame zero of the mode, so the pot is
+    // already in it rather than flashing white for a frame.
+    const tinted = cutData.length > 0 && pixelU.length * 3 === cutData.length;
+    if (tinted) {
+      const glow = new THREE.Color(ledGlow(model.parameters.led));
+      const tint = new Float32Array(cutData.length);
+      for (let i = 0; i < pixelU.length; i += 1) {
+        const reach = ledThrow(position, pixelV[i]);
+        const [r, g, b] = addressable
+          ? pixelColor(effect, pixelU[i], pixelV[i], 0, baseHsl)
+          : [glow.r, glow.g, glow.b];
+        tint[i * 3] = r * reach; tint[i * 3 + 1] = g * reach; tint[i * 3 + 2] = b * reach;
+      }
+      openings.setAttribute('color', new THREE.BufferAttribute(tint, 3));
+    }
+
+    const bent = new THREE.BufferGeometry();
+    bent.setAttribute('position', new THREE.BufferAttribute(new Float32Array(petalData), 3));
+    bent.computeVertexNormals();
+
+    return { wall: surface, creases: lines, cutouts: openings, petals: bent, pixelU, pixelV, tinted };
+  }, [shell, t, model.parameters.perfLift, model.parameters.led, addressable, effect, baseHsl, position, fills]);
 
   // Each geometry gets its own cleanup. Sharing one effect would dispose buffers
   // that are still mounted every time only the assembly slider moves.
   useEffect(() => () => { wall.dispose(); }, [wall]);
   useEffect(() => () => { creases.dispose(); }, [creases]);
+  useEffect(() => () => { cutouts.dispose(); }, [cutouts]);
+  useEffect(() => () => { petals.dispose(); }, [petals]);
+  useEffect(() => () => { shell.liner?.dispose(); }, [shell.liner]);
   useEffect(() => () => { shell.base.dispose(); }, [shell.base]);
   useEffect(() => () => { shell.rim.dispose(); }, [shell.rim]);
 
   useFrame((_, delta) => {
     if (group.current && autoRotate.current) group.current.rotation.y += delta * 0.22;
+
+    // The effect runs on the geometry that is already there: one pass over the
+    // colour buffer a frame, nothing rebuilt. A solid colour has no tempo and
+    // is left exactly as it was baked.
+    if (!addressable || tempo <= 0) return;
+    const tint = cutouts.getAttribute('color') as THREE.BufferAttribute | undefined;
+    if (!tint || tint.count !== pixelU.length) return;
+    phase.current += delta * tempo;
+    for (let i = 0; i < pixelU.length; i += 1) {
+      const reach = ledThrow(position, pixelV[i]);
+      const [r, g, b] = pixelColor(effect, pixelU[i], pixelV[i], phase.current, baseHsl);
+      tint.setXYZ(i, r * reach, g * reach, b * reach);
+    }
+    tint.needsUpdate = true;
   });
+
+  // A cured UV film is what you are actually looking at on a printed pot, and
+  // the varnish pass is the whole difference between a matte one and a wet one.
+  const printSkin = useMemo(
+    () => (wall.getAttribute('color') ? { roughness: model.parameters.printVarnish ? 0.26 : 0.62 } : null),
+    [wall, model.parameters.printVarnish],
+  );
+  // The collar is printed flat, in the palette's darkest tone — the frame round
+  // the artwork, and the first thing seen from above.
+  const plateColor = model.print ? collarColour(model.parameters) : accentColor;
 
   return (
     <group ref={group}>
       <mesh geometry={wall} frustumCulled={false}>
-        <meshStandardMaterial
-          color={wallColor} metalness={finish.metalness} roughness={finish.roughness}
-          side={THREE.DoubleSide} flatShading
+        <Skin stone={stoneSkin} print={printSkin} color={wallColor} finish={finish} />
+      </mesh>
+      {/* The drafting layer, and an imported image — everything printed OVER
+          the fills. A decal on the same facets rather than a second colour in
+          the same material: white line work cannot be had by multiplying a
+          base colour, and multiplying is all one material can do. */}
+      {artwork && (
+        <mesh geometry={wall} frustumCulled={false} renderOrder={1}>
+          <meshStandardMaterial
+            map={artwork} transparent depthWrite={false}
+            metalness={0} roughness={model.parameters.printVarnish ? 0.26 : 0.62}
+            side={THREE.DoubleSide}
+            polygonOffset polygonOffsetFactor={-2} polygonOffsetUnits={-2}
+          />
+        </mesh>
+      )}
+      {/* The light arriving through the wall. Unlit by the scene — it is a
+          source, not a surface, so it holds its colour whatever the studio
+          lighting and the finish are doing around it. */}
+      <mesh geometry={cutouts} frustumCulled={false} renderOrder={1}>
+        {/* Keyed on the strip: turning vertex colours on needs a fresh material,
+            because three.js only recompiles the shader when one is built. */}
+        <meshBasicMaterial
+          key={tinted ? 'tinted' : 'plain'}
+          color={tinted ? '#ffffff' : lightColor} vertexColors={tinted}
+          side={THREE.DoubleSide} toneMapped={false}
         />
       </mesh>
+      {/* The petals, still part of the wall and still in its material — they
+          were never removed from it, only bent out of its plane. */}
+      <mesh geometry={petals} frustumCulled={false} renderOrder={2}>
+        <Skin stone={stoneSkin} print={printSkin} color={wallColor} finish={finish} />
+      </mesh>
+      {/* The soil box, opaque and matte, dropped in as the pot closes — it is
+          fitted last on the bench too. */}
+      {shell.liner && t > 0.62 && (
+        <mesh geometry={shell.liner} frustumCulled={false}>
+          <meshStandardMaterial
+            color="#26282f" metalness={0} roughness={0.92} side={THREE.DoubleSide}
+            transparent opacity={Math.min(1, (t - 0.62) / 0.28)}
+          />
+        </mesh>
+      )}
       <mesh geometry={shell.base} position={shell.baseFlat.clone().lerp(shell.baseBuilt, t)} frustumCulled={false}>
-        <meshStandardMaterial color={accentColor} metalness={finish.metalness} roughness={finish.roughness} side={THREE.DoubleSide} />
+        <Skin stone={stoneSkin} color={plateColor} finish={finish} flat={false} />
       </mesh>
       <mesh geometry={shell.rim} position={shell.rimFlat.clone().lerp(shell.rimBuilt, t)} frustumCulled={false}>
-        <meshStandardMaterial color={accentColor} metalness={finish.metalness} roughness={finish.roughness} side={THREE.DoubleSide} />
+        <Skin stone={stoneSkin} color={plateColor} finish={finish} flat={false} />
       </mesh>
       <lineSegments geometry={creases} frustumCulled={false} renderOrder={2}>
         <lineBasicMaterial color="#12121a" transparent opacity={0.55} />
@@ -592,6 +1034,22 @@ function PlanterNet({ model, thumb = false }: { model: PlanterModel; thumb?: boo
     return placed;
   });
   const pieces = thumb ? stacked : model.pieces;
+  // Only on the real sheet: a thumbnail restacks the bands to show the wall's
+  // shape, and the facets would then be drawn where the parts no longer are.
+  const printFills = useMemo(() => {
+    const fills = model.print?.fills ?? [];
+    if (thumb || fills.length === 0) return [];
+    const stride = model.parameters.sides + 1;
+    const perBand = model.parameters.sides * 2;
+    return model.triangles.flatMap((triangle, index) => {
+      const band = Math.floor(index / perBand);
+      const flat = triangle.v.map(
+        (id) => model.flatByBand[band][Math.floor(id / stride) - band][id % stride],
+      ) as [Vec2, Vec2, Vec2];
+      const inked = insetTriangle(flat, model.parameters.printGrout);
+      return inked ? [{ index, points: inked, fill: fills[index] }] : [];
+    });
+  }, [model, thumb]);
   const width = thumb ? Math.max(...stacked.map((piece) => piece.width)) : Math.max(model.sheet.width, stock.width);
   const height = thumb ? stackY - gap : Math.max(model.sheet.height, stock.height);
   const weight = (thumb ? 0.006 : 0.0016) * Math.max(width, height);
@@ -610,8 +1068,24 @@ function PlanterNet({ model, thumb = false }: { model: PlanterModel; thumb?: boo
             stroke="#2a2d3d" strokeWidth={weight} strokeDasharray={`${weight * 12} ${weight * 8}`}
           />
         )}
+        {/* The print, under the tool paths. The milling sheet and the print
+            file are the same sheet in the same millimetres — that is the whole
+            reason the artwork can be laid out on facets at all — so the one
+            drawing carries both, with the ink already pulled back from every
+            crease the cutter is about to put in. */}
+        {!thumb && printFills.length > 0 && (
+          <g id="print">
+            {printFills.map((tile) => (
+              <polygon
+                key={tile.index}
+                points={tile.points.map((point) => `${point.x.toFixed(2)},${point.y.toFixed(2)}`).join(' ')}
+                fill={tile.fill}
+              />
+            ))}
+          </g>
+        )}
         {pieces.map((piece) => {
-          const { outline, folds, holes } = placedGeometry(piece);
+          const { outline, folds, holes, flaps } = placedGeometry(piece);
           return (
             <g key={piece.id}>
               <polygon
@@ -623,6 +1097,15 @@ function PlanterNet({ model, thumb = false }: { model: PlanterModel; thumb?: boo
                 <polygon
                   key={i} points={hole.map((point) => `${point.x.toFixed(2)},${point.y.toFixed(2)}`).join(' ')}
                   fill="var(--surface-0, #0d0f16)"
+                  stroke={FOLD_COLORS.cut} strokeWidth={weight} strokeDasharray={STROKE_DASH.cut}
+                />
+              ))}
+              {flaps.map((flap, i) => (
+                <polyline
+                  key={`flap-${i}`}
+                  points={flapSlit(flap as Triangle2, model.parameters.perfTool)
+                    .map((point) => `${point.x.toFixed(2)},${point.y.toFixed(2)}`).join(' ')}
+                  fill="none"
                   stroke={FOLD_COLORS.cut} strokeWidth={weight} strokeDasharray={STROKE_DASH.cut}
                 />
               ))}
@@ -668,12 +1151,29 @@ export default function PlanterStudio({ onStatus }: { onStatus?: (status: Studio
   const [customColor, setCustomColor] = useState('#c0392b');
   const [backdropId, setBackdropId] = useState(PLANTER_BACKDROPS[0].id);
   const [plant, setPlant] = useState<PlantId>('none');
+  const [stoneFamily, setStoneFamily] = useState<string>('all');
   const [search, setSearch] = useState('');
   const [category, setCategory] = useState<PlanterCategory | 'all'>('all');
   const [view, setView] = useState<ViewAngle>('hero');
+  /** Set when "Light me up" had to widen the collar to land the panel on it. */
+  const [collarNote, setCollarNote] = useState<string | null>(null);
+  /** The pattern family to come back to when the wall is switched on again. */
+  const [family, setFamilyState] = useState<PlanterPerforation>('triangles');
   const [playing, setPlaying] = useState(false);
   const [reducedMotion, setReducedMotion] = useState(false);
+  /** What the last import did — the resolution it landed at, or why it did not. */
+  const [artworkNote, setArtworkNote] = useState<string | null>(null);
+  /**
+   * The facet-angle effect's level, remembered while it is switched off.
+   *
+   * Off is `printShade: 0` and nothing else, because the engine has one lever
+   * for this and a second one would be a second opinion about it. So the level
+   * lives here instead — switch the effect back on and it comes back where it
+   * was rather than at a default nobody chose.
+   */
+  const [shadeLevel, setShadeLevel] = useState(35);
   const viewportRef = useRef<HTMLDivElement>(null);
+  const fileRef = useRef<HTMLInputElement>(null);
 
   const material = getMaterial(materialId);
   const finish = finishById(finishId);
@@ -683,6 +1183,20 @@ export default function PlanterStudio({ onStatus }: { onStatus?: (status: Studio
   const stats = useMemo(() => getPlanterStats(model, material), [model, material]);
   const checks = useMemo(() => getPlanterChecks(model, material), [model, material]);
   const blocking = checks.some((check) => check.severity === 'error');
+  const lit = isLitPlanter(parameters);
+  const coat = model.stone;
+  const job = model.print;
+  const stoneShelf = useMemo(
+    () => (stoneFamily === 'all' ? STONE_MATERIALS : STONE_MATERIALS.filter((item) => item.family === stoneFamily)),
+    [stoneFamily],
+  );
+  const cutOuts = model.perfCells.reduce(
+    (count, facet) => count + facet.cells.length + facet.flaps.length, 0,
+  );
+  // The collar carries two holes once the panel fits: the planting hole, and
+  // the window. One means the panel was asked for and could not be landed.
+  const panelCut = (model.pieces.find((piece) => piece.id === 'rim')?.holes.length ?? 0) > 1;
+  const light = model.lighting;
 
   const filtered = PLANTER_PRESETS.filter((preset) =>
     (category === 'all' || preset.category === category)
@@ -691,6 +1205,108 @@ export default function PlanterStudio({ onStatus }: { onStatus?: (status: Studio
   const update = useCallback(<K extends keyof PlanterParameters>(key: K, value: PlanterParameters[K]) => {
     setParameters((current) => ({ ...current, [key]: value }));
   }, []);
+
+  /**
+   * One click, on whatever is already on the bench.
+   *
+   * Everything the kit needs is measured off the design rather than typed in,
+   * so this works on a pot somebody drew ten minutes ago without their having
+   * to know that a panel wants a wide collar or that the cavity has to clear
+   * the wall. The one thing it can change behind your back is the collar, and
+   * that gets said out loud rather than done quietly.
+   */
+  const lightUp = useCallback(() => {
+    const next = litPlanter(parameters);
+    // Both of these are the button redrawing somebody else's numbers, so both
+    // are said out loud. Silently widening a collar or turning a strip down is
+    // how a generator stops being trusted.
+    setCollarNote([
+      next.rimWidth > parameters.rimWidth + 0.5
+        ? `Collar widened from ${Math.round(parameters.rimWidth)} to ${Math.round(next.rimWidth)} mm, to seat the panel`
+        : '',
+      next.ledBrightness < 100
+        ? `Strip set to ${Math.round(next.ledBrightness)}%, which is what this panel carries through ${Math.round(next.ledHours)} h`
+        : '',
+    ].filter(Boolean).join(' · ') || null);
+    setParameters(next);
+  }, [parameters]);
+
+  const lightOff = useCallback(() => {
+    setCollarNote(null);
+    setParameters((current) => unlitPlanter(current));
+  }, []);
+
+  /**
+   * The toolbar picks the size; 0 is the button that leaves the wall solid.
+   * Picking a size on a solid wall turns the pattern back on in whichever
+   * family was last chosen, so the row never feels like a dead control.
+   */
+  const setCutSize = useCallback((density: number) => {
+    setParameters((current) => (density === 0
+      ? { ...current, perforation: 'none' as const }
+      : {
+        ...current,
+        perforation: current.perforation === 'none' ? family : current.perforation,
+        perfDensity: density,
+      }));
+  }, [family]);
+
+  const setFamily = useCallback((next: PlanterPerforation) => {
+    setFamilyState(next);
+    setParameters((current) => ({ ...current, perforation: next }));
+  }, []);
+
+  /**
+   * Another pot, same design.
+   *
+   * The seed is the whole of the draw, so this is the only thing the button
+   * touches — the palette, the rule and every dimension stay exactly as they
+   * were, and the same number will bring this pot back.
+   */
+  const reroll = useCallback(() => {
+    setParameters((current) => ({ ...current, printSeed: Math.floor(Math.random() * 999_999) }));
+  }, []);
+
+  /**
+   * A customer's own artwork, read in the browser and never sent anywhere.
+   *
+   * It is kept as a data URL because that is what ends up inside the exported
+   * print file: one self-contained SVG the shop can drop on a RIP, with no
+   * second file to lose. That is also why the size is capped — the file has to
+   * stay openable at the other end.
+   */
+  const loadArtwork = useCallback((file: File | null) => {
+    if (!file) return;
+    if (!/^image\/(png|jpeg)$/.test(file.type)) {
+      setArtworkNote('PNG or JPEG only — that file was not loaded.');
+      return;
+    }
+    if (file.size > MAX_ARTWORK_BYTES) {
+      setArtworkNote(`That file is ${(file.size / 1e6).toFixed(1)} MB and the limit is ${MAX_ARTWORK_BYTES / 1e6} MB — it goes whole into the print file, and one that heavy stops opening at the other end.`);
+      return;
+    }
+    const reader = new FileReader();
+    reader.onerror = () => setArtworkNote('The file could not be read.');
+    reader.onload = () => {
+      const url = String(reader.result ?? '');
+      setParameters((current) => ({ ...current, print: 'image', printImage: url }));
+      // What the shop actually needs to know about a supplied image: not how
+      // many pixels it has, but how many it has per millimetre of pot.
+      const probe = new Image();
+      probe.onload = () => {
+        const box = wallNetBox(model);
+        const acrossMm = Math.max(box.maxX - box.minX, 1);
+        const dpi = probe.width / (acrossMm / 25.4);
+        setArtworkNote(
+          `${probe.width}×${probe.height} px across ${Math.round(acrossMm)} mm of net — ${Math.round(dpi)} DPI`
+          + (dpi < 150 ? ' · under 150 DPI it will print soft' : ' · enough for print'),
+        );
+      };
+      probe.onerror = () => setArtworkNote('The file loaded but did not open as an image.');
+      probe.src = url;
+    };
+    reader.readAsDataURL(file);
+  }, [model]);
 
   const startFromScratch = useCallback(() => {
     setPresetId(BLANK_PLANTER.id);
@@ -849,6 +1465,278 @@ export default function PlanterStudio({ onStatus }: { onStatus?: (status: Studio
         </div>
 
         <div className="sidebar-section">
+          <div className="panel-title">Solar lighting <Lightbulb size={13} aria-hidden="true" /></div>
+          <button type="button" className={`light-me ${lit ? 'on' : ''}`} onClick={lit ? lightOff : lightUp}>
+            <Lightbulb size={16} aria-hidden="true" />
+            {lit ? 'Turn the lighting off' : 'Light me up'}
+          </button>
+          <p className="footnote">
+            {lit
+              ? `The kit is fitted to this design: an inner box separating the soil from the light cavity, cut-outs milled through the wall for the light to leave by, a panel window in the collar${light ? `, and a ${LED_COPY[light.led].short} strip in the cavity` : ''}.`
+              : 'One click fits the whole kit to the pot on the bench — an inner box separating the soil from the light cavity, cut-outs milled through the wall, a panel window in the collar and a warm white strip in the cavity. Every dimension, down to what it is run at, is measured off the design itself.'}
+          </p>
+          {collarNote && <p className="field-hint tech-data">{collarNote}</p>}
+        </div>
+
+        {lit && (<>
+        <div className="sidebar-section">
+          <div className="panel-title">LED strip <span>what is in the cavity</span></div>
+          <div className="category-pills" role="group" aria-label="LED strip">
+            {LEDS.map((id) => (
+              <button
+                key={id}
+                type="button"
+                className={`pill led ${parameters.led === id ? 'active' : ''}`}
+                aria-pressed={parameters.led === id}
+                onClick={() => update('led', id)}
+              >
+                <i className="led-dot" style={ledSwatch(id)} aria-hidden="true" />
+                {LED_COPY[id].short}
+              </button>
+            ))}
+          </div>
+          <p className="footnote">{LED_COPY[parameters.led].note}</p>
+          <div className="category-pills" role="group" aria-label="Strip position">
+            {LED_POSITIONS.map((id) => (
+              <button
+                key={id}
+                type="button"
+                className={`pill ${parameters.ledPosition === id ? 'active' : ''}`}
+                aria-pressed={parameters.ledPosition === id}
+                onClick={() => update('ledPosition', id)}
+              >{LED_POSITION_COPY[id].name}</button>
+            ))}
+          </div>
+          <p className="footnote">{LED_POSITION_COPY[parameters.ledPosition].note}</p>
+          <div className="category-pills" role="group" aria-label="LED density">
+            {LED_DENSITIES.map((step) => (
+              <button
+                key={step}
+                type="button"
+                className={`pill ${parameters.ledDensity === step ? 'active' : ''}`}
+                aria-pressed={parameters.ledDensity === step}
+                onClick={() => update('ledDensity', step)}
+              >{step}/m</button>
+            ))}
+          </div>
+          <SliderField label="Runs round the cavity" value={parameters.ledRuns} min={1} max={6} step={1} onChange={(value) => update('ledRuns', value)} />
+          <SliderField label="Run at" value={parameters.ledBrightness} min={5} max={100} step={5} suffix="%" onChange={(value) => update('ledBrightness', value)} />
+          <SliderField label="Hours after dark" value={parameters.ledHours} min={1} max={14} step={1} suffix=" h" onChange={(value) => update('ledHours', value)} />
+          <p className="field-hint tech-data">
+            {light
+              ? `${light.leds} emitters on ${(light.length / 1000).toFixed(2)} m of strip · ${light.watts.toFixed(1)} W as set, ${light.peakWatts.toFixed(1)} W flat out`
+              : 'No strip specified — the cavity is left empty'}
+          </p>
+          <p className="footnote">
+            A denser strip reads as a line of light rather than a string of dots, and costs proportionally more current — every emitter draws its own. The strip bonds to the outside face of the liner and looks at the cut-outs: one run washes up from the bottom, two or more light the full height evenly.
+          </p>
+        </div>
+
+        {parameters.led === 'ws2812' && (
+        <div className="sidebar-section">
+          <div className="panel-title">Effect mode <span>{getLedEffect(parameters.ledEffect).name}</span></div>
+          <p className="footnote">Every pixel is addressed on its own. The effect runs round the pot, cut-out after cut-out.</p>
+          <div className="category-pills" role="group" aria-label="Effect mode">
+            {LED_EFFECTS.map((mode) => (
+              <button
+                key={mode.id}
+                type="button"
+                className={`pill ${parameters.ledEffect === mode.id ? 'active' : ''}`}
+                aria-pressed={parameters.ledEffect === mode.id}
+                onClick={() => update('ledEffect', mode.id)}
+              >{mode.name}</button>
+            ))}
+          </div>
+          <SliderField label="Speed" value={parameters.ledSpeed} min={5} max={100} step={5} suffix="%" onChange={(value) => update('ledSpeed', value)} />
+          <div className="led-colours" role="group" aria-label="Base colour">
+            {LED_BASE_COLOURS.map((hex) => (
+              <button
+                key={hex}
+                type="button"
+                className={`led-colour ${parameters.ledColor.toLowerCase() === hex ? 'active' : ''}`}
+                style={{ background: hex }}
+                title={hex}
+                aria-label={hex}
+                aria-pressed={parameters.ledColor.toLowerCase() === hex}
+                onClick={() => update('ledColor', hex)}
+              />
+            ))}
+            <input
+              type="color" className="led-colour picker" value={parameters.ledColor}
+              aria-label="Any colour" onChange={(event) => update('ledColor', event.target.value)}
+            />
+          </div>
+          <div className="category-pills" role="group" aria-label="Controller">
+            {LED_CONTROLLER_ORDER.map((id) => (
+              <button
+                key={id}
+                type="button"
+                className={`pill ${parameters.ledController === id ? 'active' : ''}`}
+                aria-pressed={parameters.ledController === id}
+                onClick={() => update('ledController', id)}
+              >{LED_CONTROLLERS[id]}</button>
+            ))}
+          </div>
+          <p className="field-hint tech-data">
+            {light && light.effect !== 'static'
+              ? `The mode averages ${Math.round(light.duty * 100)}% of the strip lit — that is what the battery and the runtime are sized on. The driver is still sized for every pixel white.`
+              : 'Solid colour — the strip is fully lit the whole time.'}
+          </p>
+          <p className="footnote">
+            The mode lives in the controller, not in the panel. The cut file is identical in every one of them — what changes here is what gets loaded onto the controller, and how much power it actually drinks.
+          </p>
+        </div>
+        )}
+
+        {light && (
+        <div className="sidebar-section">
+          <div className="panel-title">Electrical <span>{light.volts} V</span></div>
+          <dl className="spec-list tech-data">
+            <div><dt>Strip</dt><dd>{(light.length / 1000).toFixed(2)} m · {light.runs} {light.runs === 1 ? 'run' : 'runs'}</dd></div>
+            <div><dt>Emitters</dt><dd>{light.leds} × {LED_COPY[light.led].short}</dd></div>
+            <div><dt>Draw</dt><dd>{light.watts.toFixed(1)} W · {light.peakWatts.toFixed(1)} W flat out</dd></div>
+            <div><dt>Current</dt><dd>{light.amps.toFixed(2)} A at {light.volts} V</dd></div>
+            <div><dt>Supply</dt><dd>{light.volts} V · {light.supply} W</dd></div>
+            <div><dt>Feed points</dt><dd>{light.feeds} · {light.addressable ? 'data at one' : 'two wires'}</dd></div>
+            <div><dt>Output</dt><dd>≈ {Math.round(light.lumens)} lm</dd></div>
+            <div><dt>Solar harvest</dt><dd>{light.harvest > 0 ? `${light.harvest.toFixed(1)} Wh/day` : 'no panel in the collar'}</dd></div>
+            <div><dt>Runs for</dt><dd>{light.harvest > 0 ? `${light.runtime.toFixed(1)} h on a day's charge` : 'mains or pack'}</dd></div>
+            <div><dt>Night battery</dt><dd>{light.battery.toFixed(1)} Wh · {light.cells} × 18650</dd></div>
+          </dl>
+          <p className="footnote">
+            The supply carries a fifth over the flat-out draw — one run at its own ceiling gets hot and dies early. Current and lumens are quoted at full white; Draw is what this pot actually pulls at {Math.round(parameters.ledBrightness)}%. Harvest assumes a {Math.round(parameters.solarWidth)} × {Math.round(parameters.solarLength)} mm panel lying flat on an average day, charging losses included — not a summer one.
+          </p>
+        </div>
+        )}
+
+        <div className="sidebar-section">
+          <div className="panel-title">Cut-out pattern <span>milled</span></div>
+          <div className="category-pills" role="group" aria-label="Cut-out pattern">
+            <button
+              className={`pill ${parameters.perforation === 'triangles' ? 'active' : ''}`}
+              aria-pressed={parameters.perforation === 'triangles'}
+              onClick={() => setFamily('triangles')}
+            >Triangles</button>
+            <button
+              className={`pill ${parameters.perforation === 'dots' ? 'active' : ''}`}
+              aria-pressed={parameters.perforation === 'dots'}
+              onClick={() => setFamily('dots')}
+            >Scattered dots</button>
+            <button
+              className={`pill ${parameters.perforation === 'shards' ? 'active' : ''}`}
+              aria-pressed={parameters.perforation === 'shards'}
+              onClick={() => setFamily('shards')}
+            >Shards</button>
+            <button
+              className={`pill ${parameters.perforation === 'grid' ? 'active' : ''}`}
+              aria-pressed={parameters.perforation === 'grid'}
+              onClick={() => setFamily('grid')}
+            >Hole grid</button>
+            <button
+              className={`pill ${parameters.perforation === 'foldout' ? 'active' : ''}`}
+              aria-pressed={parameters.perforation === 'foldout'}
+              onClick={() => setFamily('foldout')}
+            >Cut &amp; fold</button>
+          </div>
+          <PatternPicker
+            label="Cut-out size"
+            value={parameters.perforation === 'none' ? 0 : parameters.perfDensity}
+            options={PERF_SIZES}
+            opening={parameters.perfOpening / 100}
+            family={parameters.perforation}
+            picked={parameters.perfPicked}
+            onChange={setCutSize}
+          />
+          <SliderField
+            label="Material removed" value={parameters.perfOpening} min={4} max={90} step={2} suffix="%"
+            onChange={(value) => update('perfOpening', value)}
+          />
+          <p className="field-hint tech-data">
+            {cutOuts > 0 ? `${Math.round(model.perfOpenArea * 100)}% open · ${cutOuts} cut-outs` : 'Wall left solid'}
+          </p>
+          <p className="footnote">
+            {({
+              dots: 'Mixed diameters scattered automatically across each facet — the large discs land first and the small ones fill in around them. The scatter is the same on every run, so what you approved is what gets cut. ',
+              shards: 'Right triangles on a grid, each turned at random and most of the grid left empty, so the grid underneath never shows. ',
+              grid: 'An even field of equal holes, staggered row to row — the plain industrial perforation, good on facets that should not pull the eye. ',
+              triangles: 'A triangle lattice cut from the same triangles the wall itself is made of. ',
+              foldout: 'Cut and fold — petals severed on two edges and left hinged on the third. Nothing leaves the sheet: the part weighs the same as it did before, and the opening is made by the bend itself. ',
+            } as Record<string, string>)[parameters.perforation] ?? ''}
+            Every cut-out is laid out inside one facet and never crosses a crease. Two separate levers:
+            <b> material removed</b> decides how much of the panel is cut, <b>pattern fineness</b> decides
+            how many pieces it is cut into. Composite carries its load in two thin skins, so a decorative
+            cut-out stays low — the wall has to stay a wall.
+          </p>
+        </div>
+
+        <div className="sidebar-section">
+          <div className="panel-title">Milling <span>shop dimensions</span></div>
+          <SliderField label="Pattern fineness" value={parameters.perfDensity} min={1} max={8} step={1} onChange={(value) => update('perfDensity', value)} />
+          {parameters.perforation === 'triangles' && (
+            <>
+              <SliderField
+                label="Triangles cut" value={parameters.perfPicked} min={0}
+                max={parameters.perfDensity * parameters.perfDensity} step={1}
+                onChange={(value) => update('perfPicked', value)}
+              />
+              <p className="field-hint tech-data">
+                {parameters.perfPicked > 0
+                  ? `${parameters.perfPicked} of ${parameters.perfDensity * parameters.perfDensity} triangles per facet`
+                  : `all ${parameters.perfDensity * parameters.perfDensity} triangles per facet`}
+              </p>
+            </>
+          )}
+          <SliderField label="Web between cut-outs" value={parameters.perfWeb} min={3} max={40} step={1} suffix=" mm" onChange={(value) => update('perfWeb', value)} />
+          <SliderField label="Border at the creases" value={parameters.perfMargin} min={5} max={80} step={1} suffix=" mm" onChange={(value) => update('perfMargin', value)} />
+          <SliderField label="Cutter diameter" value={parameters.perfTool} min={1} max={20} step={1} suffix=" mm" onChange={(value) => update('perfTool', value)} />
+          <SliderField label="Solid skirt at the foot" value={parameters.perfSkirt} min={0} max={Math.round(parameters.height)} step={5} suffix=" mm" onChange={(value) => update('perfSkirt', value)} />
+          <SliderField label="Dissolve height" value={parameters.perfFade} min={0} max={Math.round(parameters.height)} step={5} suffix=" mm" onChange={(value) => update('perfFade', value)} />
+          {parameters.perforation === 'foldout' && (
+            <>
+              <SliderField label="Bend angle" value={parameters.perfLift} min={0} max={90} step={1} suffix="°" onChange={(value) => update('perfLift', value)} />
+              <p className="field-hint tech-data">
+                Bent by hand — the cut file is identical at any angle. This drives the preview and the note that ships with the drawing.
+              </p>
+            </>
+          )}
+          <p className="field-hint tech-data">
+            {parameters.perfFade > 0
+              ? `Solid base, pattern arriving over ${Math.round(parameters.perfFade)} mm above the skirt`
+              : 'Pattern starts abruptly at the skirt line'}
+          </p>
+          <p className="field-hint tech-data">
+            Corners drawn at {(parameters.perfTool / 2).toFixed(1)} mm — exactly what the mill leaves
+            {model.perfDropped > 0 ? ` · ${model.perfDropped} cells left solid` : ''}
+          </p>
+        </div>
+
+        <div className="sidebar-section">
+          <div className="panel-title">Inner box <span>soil barrier</span></div>
+          <SliderField label="Light cavity" value={parameters.cavity} min={6} max={60} step={1} suffix=" mm" onChange={(value) => update('cavity', value)} />
+          <p className="field-hint tech-data">
+            {model.liner
+              ? `${Math.round(model.liner.height)} mm tall · holds ${model.liner.litres.toFixed(1)} L of soil · gap ${Math.round(parameters.cavity)}–${Math.round(model.liner.mouthGap)} mm`
+              : 'No room for a box at this cavity — narrow it, or widen the pot'}
+          </p>
+          <p className="footnote">
+            The box is a plain prism standing on the pot&apos;s floor. Soil goes in it, the strip runs in the
+            cavity around it, and both floors are drilled to drain so water never sits in the light cavity.
+          </p>
+        </div>
+
+        <div className="sidebar-section">
+          <div className="panel-title">Solar panel <span>in the collar</span></div>
+          <NumberField label="Panel width" value={parameters.solarWidth} suffix=" mm" min={30} max={600} onChange={(value) => update('solarWidth', value)} />
+          <NumberField label="Panel length" value={parameters.solarLength} suffix=" mm" min={30} max={600} onChange={(value) => update('solarLength', value)} />
+          <p className="field-hint tech-data">
+            {panelCut
+              ? `Window cut ${Math.round(parameters.solarWidth) - 12} × ${Math.round(parameters.solarLength) - 12} mm — the panel beds from beneath and sits on the lip`
+              : `No window cut — the collar needs at least ${Math.ceil(parameters.solarLength + 16)} mm`}
+          </p>
+        </div>
+        </>)}
+
+        <div className="sidebar-section">
           <div className="panel-title">Material <span>Stock</span></div>
           <div className="select-wrap">
             <label className="sr-only" htmlFor="planter-material">Material</label>
@@ -904,6 +1792,389 @@ export default function PlanterStudio({ onStatus }: { onStatus?: (status: Studio
         </div>
 
         <div className="sidebar-section">
+          <div className="panel-title">Natural texture <Mountain size={13} aria-hidden="true" /></div>
+          <p className="field-hint">
+            Forty stones from the DXF-STONE catalogue, painted on by hand after the pot is
+            folded. Nothing here moves a cut line — the flat file exports byte for byte the
+            same with a stone on it and without one.
+          </p>
+          <div className="category-pills" role="group" aria-label="Stone family">
+            <button
+              type="button"
+              className={`pill ${stoneFamily === 'all' ? 'active' : ''}`}
+              aria-pressed={stoneFamily === 'all'}
+              onClick={() => setStoneFamily('all')}
+            >All</button>
+            {STONE_FAMILIES.map((id) => (
+              <button
+                key={id}
+                type="button"
+                className={`pill ${stoneFamily === id ? 'active' : ''}`}
+                aria-pressed={stoneFamily === id}
+                onClick={() => setStoneFamily(id)}
+              >{id}</button>
+            ))}
+          </div>
+          <div className="stone-grid" role="group" aria-label="Stone catalogue">
+            <button
+              type="button"
+              className={`stone-chip bare ${parameters.stone === 'none' ? 'active' : ''}`}
+              aria-pressed={parameters.stone === 'none'}
+              onClick={() => update('stone', 'none')}
+            >
+              <span className="stone-name">No stone</span>
+              <span className="stone-code">panel finish</span>
+            </button>
+            {stoneShelf.map((item) => (
+              <button
+                key={item.id}
+                type="button"
+                className={`stone-chip ${parameters.stone === item.id ? 'active' : ''}`}
+                style={{ backgroundColor: item.tone, backgroundImage: `url(/media/stone/${item.id}/chip.jpg)` }}
+                aria-pressed={parameters.stone === item.id}
+                title={stoneName(item)}
+                onClick={() => update('stone', item.id)}
+              >
+                <span className="stone-name">{stoneName(item)}</span>
+                <span className="stone-code">{item.code} · {item.tileMm} mm tile</span>
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {coat && (<>
+        <div className="sidebar-section">
+          <div className="panel-title">The coat <span>{MAX_COAT_MM} mm ceiling</span></div>
+          <SliderField
+            label="Build thickness" value={parameters.stoneCoat} min={0} max={MAX_COAT_MM} step={0.5} suffix=" mm"
+            onChange={(value) => update('stoneCoat', value)}
+          />
+          <p className="field-hint tech-data">
+            {parameters.stoneCoat > 0
+              ? `${coat.passes} render ${coat.passes === 1 ? 'pass' : 'passes'} · ${coat.coats} coats · ${coat.days} working ${coat.days === 1 ? 'day' : 'days'}`
+              : 'Colour only, no build — all of the stone is in the glaze'}
+          </p>
+          <SliderField
+            label="Relief worked" value={parameters.stoneRelief} min={0} max={100} step={5} suffix="%"
+            onChange={(value) => update('stoneRelief', value)}
+          />
+          <p className="field-hint tech-data">
+            Preview shows {coat.reliefMm.toFixed(1)} mm of relief — exactly what the build buys, never more
+          </p>
+          <SliderField
+            label="Batch drift" value={parameters.stoneTone} min={0} max={100} step={5} suffix="%"
+            onChange={(value) => update('stoneTone', value)}
+          />
+          <div className="led-colours" role="group" aria-label="Glaze wash">
+            {STONE_TINTS.map((hex) => (
+              <button
+                key={hex}
+                type="button"
+                className={`led-colour ${parameters.stoneTint.toLowerCase() === hex ? 'active' : ''}`}
+                style={{ background: hex }}
+                title={hex === '#ffffff' ? 'No wash — the stone as photographed' : hex}
+                aria-label={hex}
+                aria-pressed={parameters.stoneTint.toLowerCase() === hex}
+                onClick={() => update('stoneTint', hex)}
+              />
+            ))}
+            <input
+              type="color" className="led-colour picker" value={parameters.stoneTint}
+              aria-label="Custom wash" onChange={(event) => update('stoneTint', event.target.value)}
+            />
+          </div>
+          <div className="category-pills" role="group" aria-label="Sealer">
+            {STONE_SEALS.map((id) => (
+              <button
+                key={id}
+                type="button"
+                className={`pill ${parameters.stoneSeal === id ? 'active' : ''}`}
+                aria-pressed={parameters.stoneSeal === id}
+                onClick={() => update('stoneSeal', id)}
+              >{SEAL_NAMES[id]}</button>
+            ))}
+          </div>
+        </div>
+
+        <div className="sidebar-section">
+          <div className="panel-title">Paint card <span>{coat.code}</span></div>
+          <dl className="spec-list tech-data">
+            <div><dt>Stone</dt><dd>{stoneName(stoneById(coat.stone) ?? STONE_MATERIALS[0])}</dd></div>
+            <div><dt>Painted area</dt><dd>{coat.areaM2.toFixed(2)} m² · wall and collar</dd></div>
+            <div><dt>Coats</dt><dd>{coat.coats} · {coat.passes} of them build</dd></div>
+            <div><dt>Render to mix</dt><dd>{coat.litres.toFixed(1)} L</dd></div>
+            <div><dt>Weight added</dt><dd>{coat.kg.toFixed(1)} kg</dd></div>
+            <div><dt>Bench time</dt><dd>{coat.hours.toFixed(1)} h · {coat.days} {coat.days === 1 ? 'day' : 'days'}</dd></div>
+            <div><dt>Crease keep-out</dt><dd>{coat.keepOut.toFixed(0)} mm · {coat.reliefRun.toFixed(2)} m of crease</dd></div>
+            <div>
+              <dt>Cut-outs after paint</dt>
+              <dd>{coat.opening > 0
+                ? `${coat.opening.toFixed(0)} → ${Math.max(0, coat.throat).toFixed(0)} mm`
+                : 'solid wall'}</dd>
+            </div>
+            <div><dt>Sealer</dt><dd>{SEAL_NAMES[coat.seal]}</dd></div>
+          </dl>
+          <p className="footnote">
+            The glaze is the painter&apos;s own — they pull out the high points, float a wash
+            into the hollows and decide where this particular pot has weathered. No two match,
+            and they are not meant to.
+          </p>
+        </div>
+        </>)}
+
+        <div className="sidebar-section">
+          <div className="panel-title">Direct UV print <span>after the mill, before the fold</span></div>
+          <p className="field-hint">
+            The panel reaches the bed already grooved and already cut, and still flat. The
+            artwork is a file in the same millimetres as the DXF, registered to the outline the
+            mill has just made. The facets are exactly the regions that never bend — which is
+            why filling by triangle is not merely a nice pattern here, it is the one that
+            survives the fold.
+          </p>
+          <div className="category-pills" role="group" aria-label="What is printed">
+            {PRINT_MODES.map((id) => (
+              <button
+                key={id}
+                type="button"
+                className={`pill ${parameters.print === id ? 'active' : ''}`}
+                aria-pressed={parameters.print === id}
+                onClick={() => update('print', id as PlanterPrint)}
+              >{PRINT_MODE_LABELS[id]}</button>
+            ))}
+          </div>
+        </div>
+
+        {parameters.print === 'triangles' && (<>
+        <div className="sidebar-section">
+          <div className="panel-title">Colour generator <span>{PRINT_RULE_NAMES[parameters.printRule]}</span></div>
+          <div className="category-pills" role="group" aria-label="Fill rule">
+            {PRINT_RULES.map((id) => (
+              <button
+                key={id}
+                type="button"
+                className={`pill ${parameters.printRule === id ? 'active' : ''}`}
+                aria-pressed={parameters.printRule === id}
+                onClick={() => update('printRule', id as PlanterPrintRule)}
+              >{PRINT_RULE_NAMES[id]}</button>
+            ))}
+          </div>
+          <button className="action-btn" style={{ marginTop: 'var(--space-4)' }} onClick={reroll}>
+            <Shuffle size={12} aria-hidden="true" /> Roll again · seed {parameters.printSeed}
+          </button>
+          <p className="field-hint tech-data">
+            The seed is one integer and it decides the whole draw. The same seed gives the same
+            pot on any machine on any day, so a design approved last month prints in the colours
+            it was approved in.
+          </p>
+        </div>
+
+        <div className="sidebar-section">
+          <div className="panel-title">Palette <span className="tech-data">{job?.colours ?? 0} colours</span></div>
+          <div className="stone-grid" role="group" aria-label="Palettes">
+            {[...PRINT_PALETTES.map((item) => item.id), CUSTOM_PALETTE].map((id) => {
+              const colours = paletteColours(id, parameters.printColors).slice(0, parameters.printTones);
+              const stops = colours.map((hex, i) => `${hex} ${(i / colours.length) * 100}%, ${hex} ${((i + 1) / colours.length) * 100}%`);
+              return (
+                <button
+                  key={id}
+                  type="button"
+                  className={`stone-chip ${parameters.printPalette === id ? 'active' : ''}`}
+                  style={{ backgroundImage: `linear-gradient(135deg, ${stops.join(', ')})` }}
+                  aria-pressed={parameters.printPalette === id}
+                  title={paletteName(id)}
+                  onClick={() => update('printPalette', id)}
+                >
+                  <span className="stone-name">{paletteName(id)}</span>
+                  <span className="stone-code">{colours.length} tones</span>
+                </button>
+              );
+            })}
+          </div>
+          {parameters.printPalette === CUSTOM_PALETTE && (
+            <div className="led-colours" role="group" aria-label="My colours" style={{ marginTop: 'var(--space-4)' }}>
+              {parameters.printColors.map((hex, index) => (
+                <input
+                  key={index}
+                  type="color"
+                  className="led-colour picker"
+                  value={hex}
+                  aria-label={`Colour ${index + 1}`}
+                  onChange={(event) => update(
+                    'printColors',
+                    parameters.printColors.map((was, i) => (i === index ? event.target.value : was)),
+                  )}
+                />
+              ))}
+            </div>
+          )}
+          <SliderField
+            label="Tones in play" value={parameters.printTones} min={2} max={MAX_PRINT_TONES} step={1}
+            onChange={(value) => update('printTones', value)}
+          />
+          <div className="category-pills" role="group" aria-label="Angle effect">
+            <button
+              type="button"
+              className={`pill ${parameters.printShade > 0 ? 'active' : ''}`}
+              aria-pressed={parameters.printShade > 0}
+              onClick={() => update('printShade', shadeLevel)}
+            >Angle effect</button>
+            <button
+              type="button"
+              className={`pill ${parameters.printShade === 0 ? 'active' : ''}`}
+              aria-pressed={parameters.printShade === 0}
+              onClick={() => update('printShade', 0)}
+            >Off</button>
+          </div>
+          {parameters.printShade > 0 && (
+            <SliderField
+              label="Strength" value={parameters.printShade} min={5} max={100} step={5} suffix="%"
+              onChange={(value) => { setShadeLevel(value); update('printShade', value); }}
+            />
+          )}
+          <p className="field-hint tech-data">
+            {parameters.printShade > 0
+              ? `Each facet lightened or darkened by the way it faces — ${job?.colours ?? 0} colours in the file instead of ${parameters.printTones}`
+              : 'Flat colour per facet, no shading. The catalogue pot.'}
+          </p>
+        </div>
+        </>)}
+
+        {parameters.print === 'image' && (
+        <div className="sidebar-section">
+          <div className="panel-title">Artwork file <span>PNG · JPG</span></div>
+          <input
+            ref={fileRef}
+            type="file"
+            accept="image/png,image/jpeg"
+            className="sr-only"
+            onChange={(event) => loadArtwork(event.target.files?.[0] ?? null)}
+          />
+          <button className="export-button" onClick={() => fileRef.current?.click()}>
+            <ImageIcon size={13} aria-hidden="true" /> {parameters.printImage ? 'Replace file' : 'Load a PNG or JPG'}
+          </button>
+          {parameters.printImage && (
+            <>
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img
+                src={parameters.printImage}
+                alt="Loaded artwork"
+                style={{ width: '100%', borderRadius: 'var(--radius-2)', marginTop: 'var(--space-4)', display: 'block' }}
+              />
+              <button className="action-btn" style={{ marginTop: 'var(--space-3)' }} onClick={() => update('printImage', '')}>
+                <RotateCcw size={12} aria-hidden="true" /> Remove it
+              </button>
+            </>
+          )}
+          {artworkNote && <p className="field-hint tech-data">{artworkNote}</p>}
+          <div className="category-pills" role="group" aria-label="Fit" style={{ marginTop: 'var(--space-4)' }}>
+            {PRINT_FITS.map((id) => (
+              <button
+                key={id}
+                type="button"
+                className={`pill ${parameters.printFit === id ? 'active' : ''}`}
+                aria-pressed={parameters.printFit === id}
+                onClick={() => update('printFit', id as PlanterPrintFit)}
+              >{id}</button>
+            ))}
+          </div>
+          <p className="footnote">
+            The image is laid across the developed wall rather than round the pot, and those are
+            the same thing here, because the printing happens flat. A pixel that lands on a facet
+            in the net is the pixel standing on that facet once it is folded.
+          </p>
+        </div>
+        )}
+
+        {job && (<>
+        <div className="sidebar-section">
+          <div className="panel-title">Drafting layer <span>the drawing, on the pot</span></div>
+          <div className="category-pills" role="group" aria-label="Drafting layer">
+            <button
+              type="button"
+              className={`pill ${parameters.printOverlay ? 'active' : ''}`}
+              aria-pressed={parameters.printOverlay}
+              onClick={() => update('printOverlay', true)}
+            >With drafting</button>
+            <button
+              type="button"
+              className={`pill ${!parameters.printOverlay ? 'active' : ''}`}
+              aria-pressed={!parameters.printOverlay}
+              onClick={() => update('printOverlay', false)}
+            >Without</button>
+          </div>
+          <p className="footnote">
+            A protractor on every vertex of the net, swept arcs, a right-triangle glyph per facet
+            and dimension callouts — and the numbers are the pot&apos;s own. The diameter beside a
+            vertex is that ring&apos;s real diameter; the R beside a facet is its own shortest
+            edge. What is printed on the object is the drawing that made it.
+          </p>
+          {parameters.printOverlay && (
+            <>
+              <SliderField
+                label="Mark density" value={parameters.printOverlayDensity} min={0} max={100} step={5} suffix="%"
+                onChange={(value) => update('printOverlayDensity', value)}
+              />
+              <div className="led-colours" role="group" aria-label="Drafting ink">
+                {DRAFT_INKS.map((hex) => (
+                  <button
+                    key={hex}
+                    type="button"
+                    className={`led-colour ${parameters.printOverlayInk.toLowerCase() === hex ? 'active' : ''}`}
+                    style={{ background: hex }}
+                    title={hex}
+                    aria-label={hex}
+                    aria-pressed={parameters.printOverlayInk.toLowerCase() === hex}
+                    onClick={() => update('printOverlayInk', hex)}
+                  />
+                ))}
+                <input
+                  type="color" className="led-colour picker" value={parameters.printOverlayInk}
+                  aria-label="Custom drafting ink"
+                  onChange={(event) => update('printOverlayInk', event.target.value)}
+                />
+              </div>
+            </>
+          )}
+        </div>
+
+        <div className="sidebar-section">
+          <div className="panel-title">On the bed <span>{job.passes} {job.passes === 1 ? 'pass' : 'passes'}</span></div>
+          <SliderField
+            label="Grout off the creases" value={parameters.printGrout} min={0} max={MAX_GROUT} step={0.5} suffix=" mm"
+            onChange={(value) => update('printGrout', value)}
+          />
+          <p className="field-hint tech-data">
+            {parameters.printGrout > 0
+              ? `Ink stops ${parameters.printGrout.toFixed(1)} mm short of every crease and cut edge — ${job.groutRun.toFixed(2)} m of crease left bare, reading as grout between tiles`
+              : 'Ink carried straight over the grooves. A cured UV film crazes exactly there, along the most visible line on the pot.'}
+          </p>
+          <div className="category-pills" role="group" aria-label="Passes">
+            <button
+              type="button"
+              className={`pill ${parameters.printWhite ? 'active' : ''}`}
+              aria-pressed={parameters.printWhite}
+              onClick={() => update('printWhite', !parameters.printWhite)}
+            >White base</button>
+            <button
+              type="button"
+              className={`pill ${parameters.printVarnish ? 'active' : ''}`}
+              aria-pressed={parameters.printVarnish}
+              onClick={() => update('printVarnish', !parameters.printVarnish)}
+            >Varnish</button>
+          </div>
+          <dl className="spec-list tech-data">
+            <div><dt>Artwork</dt><dd>{job.mode === 'image' ? 'Imported image' : `${PRINT_RULE_NAMES[parameters.printRule]} · ${paletteName(parameters.printPalette)}`}</dd></div>
+            {job.mode === 'triangles' && <div><dt>Colours</dt><dd>{job.colours}</dd></div>}
+            <div><dt>Inked area</dt><dd>{job.areaM2.toFixed(2)} m²</dd></div>
+            <div><dt>Ink</dt><dd>{Math.round(job.inkMl)} ml</dd></div>
+            <div><dt>Bed time</dt><dd>{Math.round(job.minutes)} min</dd></div>
+            <div><dt>Bed</dt><dd>{job.tiles === 1 ? 'one pass' : `${job.tiles} tiles`} · {job.bed.width} × {job.bed.height} mm</dd></div>
+            {job.dropped > 0 && <div><dt>Facets left bare</dt><dd>{job.dropped}</dd></div>}
+          </dl>
+        </div>
+        </>)}
+
+        <div className="sidebar-section">
           <div className="panel-title">Export <span>1 : 1 scale</span></div>
           <button className="export-button" onClick={() => download(`${fileStem}.svg`, buildPlanterSvg(model, material, style.name), 'image/svg+xml')}>
             <Download size={13} aria-hidden="true" /> Export SVG
@@ -911,6 +2182,11 @@ export default function PlanterStudio({ onStatus }: { onStatus?: (status: Studio
           <button className="export-button export-secondary" onClick={() => download(`${fileStem}.dxf`, buildPlanterDxf(model), 'image/vnd.dxf')}>
             <Download size={13} aria-hidden="true" /> Export DXF
           </button>
+          {job && (
+            <button className="export-button export-secondary" onClick={() => download(`${fileStem}-print.svg`, buildPlanterPrintSvg(model, style.name), 'image/svg+xml')}>
+              <Printer size={13} aria-hidden="true" /> Export print artwork
+            </button>
+          )}
           <p className="footnote">
             {model.sheets > 1
               ? `Wall, base plate and collar nested across ${model.sheets} stock sheets. The DXF keeps CUT, MOUNTAIN and VALLEY on separate layers — groove the reverse face.`

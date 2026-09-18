@@ -1,0 +1,136 @@
+/*
+  The studio as an application window.
+
+  `garden.css` already turned the workspace bright and corrected it for RTL.
+  This sheet only adds the chrome a CAD tool has and a web section does not: a
+  command bar, a status bar, and a body that is exactly the window minus those
+  two — so nothing on the page scrolls except the inside of a panel.
+*/
+
+.cad {
+  --cad-bar: 52px;
+  --cad-status: 30px;
+
+  display: grid;
+  grid-template-rows: var(--cad-bar) minmax(0, 1fr) var(--cad-status);
+  height: 100vh;
+  height: 100dvh;
+  overflow: hidden;
+  background: #eef4ea;
+  color: #22301f;
+  font-family: var(--font-rubik), var(--font-inter), system-ui, sans-serif;
+  direction: rtl;
+}
+
+/* The app owns the whole viewport, so the document must not scroll behind it. */
+body:has(.cad) { overflow: hidden; background: #eef4ea; }
+
+/* --- command bar ---------------------------------------------------------- */
+.cad-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 0 14px;
+  background: #22301f;
+  color: #dce8d7;
+  border-bottom: 1px solid #16210f;
+}
+.cad-bar-group { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.cad-sep { width: 1px; height: 16px; background: rgba(255, 255, 255, 0.16); flex: 0 0 auto; }
+
+.cad-back {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 32px;
+  padding: 0 12px;
+  border-radius: 8px;
+  color: #dce8d7;
+  font-size: 13px;
+  font-weight: 600;
+  text-decoration: none;
+}
+.cad-back:hover { background: rgba(255, 255, 255, 0.09); color: #9ed94f; }
+
+.cad-doc { display: inline-flex; align-items: center; gap: 8px; min-width: 0; color: #a9bda4; font-size: 13px; }
+.cad-doc b {
+  overflow: hidden;
+  color: #fff;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  /* The file stem is Latin and must not be reordered by the RTL paragraph. */
+  direction: ltr;
+  unicode-bidi: embed;
+}
+
+.cad-readout { color: #a9bda4; font-size: 12px; letter-spacing: 0.02em; }
+.cad-readout span { display: inline-flex; align-items: center; gap: 6px; }
+
+.cad-state { display: inline-flex; align-items: center; gap: 7px; margin: 0; font-size: 13px; font-weight: 700; white-space: nowrap; }
+.cad-state i { width: 8px; height: 8px; border-radius: 50%; }
+.cad-state.ok { color: #9ed94f; }
+.cad-state.ok i { background: #9ed94f; box-shadow: 0 0 0 3px rgba(158, 217, 79, 0.2); }
+.cad-state.blocked { color: #ff8f7a; }
+.cad-state.blocked i { background: #ff8f7a; box-shadow: 0 0 0 3px rgba(255, 143, 122, 0.2); }
+
+.cad-action {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 32px;
+  padding: 0 13px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.07);
+  color: #eaf2e6;
+  font-size: 13px;
+  font-weight: 650;
+}
+.cad-action:hover:not(:disabled) { background: #3f8f3a; border-color: #3f8f3a; color: #fff; }
+.cad-action:disabled { opacity: 0.45; cursor: not-allowed; }
+
+.cad-icon {
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: #a9bda4;
+}
+.cad-icon:hover { background: rgba(255, 255, 255, 0.09); color: #fff; }
+
+/* --- body ----------------------------------------------------------------- */
+.cad-body { min-height: 0; padding: 10px; }
+.cad-grid { height: 100%; min-height: 0; }
+.cad-boot { display: grid; place-items: center; height: 100%; color: #74886f; font-size: 15px; }
+
+/* --- status bar ----------------------------------------------------------- */
+.cad-status {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  overflow-x: auto;
+  padding: 0 16px;
+  background: #22301f;
+  border-top: 1px solid #16210f;
+  color: #a9bda4;
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+.cad-status span { display: inline-flex; align-items: baseline; gap: 6px; flex: 0 0 auto; }
+.cad-status em { font-style: normal; opacity: 0.75; }
+.cad-status b { color: #eaf2e6; font-weight: 600; }
+.cad-status-hint { margin-inline-start: auto; opacity: 0.55; }
+.cad-status::-webkit-scrollbar { height: 0; }
+
+@media (max-width: 900px) {
+  .cad { height: auto; grid-template-rows: auto minmax(0, 1fr) auto; }
+  body:has(.cad) { overflow: auto; }
+  .cad-bar { flex-wrap: wrap; gap: 8px; padding: 8px 12px; }
+  .cad-readout { order: 3; width: 100%; }
+  .cad-body { padding: 8px; }
+}

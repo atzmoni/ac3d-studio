@@ -137,6 +137,51 @@ ul { list-style: none; padding: 0; }
 .pill { min-height: var(--control-sm); padding: 0 var(--space-4); color: var(--muted); background: var(--surface-2); border: 1px solid var(--line); border-radius: var(--radius-sm); font-size: var(--text-xs); font-weight: 600; }
 .pill:hover { color: var(--ink); border-color: var(--line-strong); }
 .pill.active { color: var(--accent); background: var(--surface-3); border-color: var(--line-strong); box-shadow: inset 0 -2px 0 var(--accent); }
+/* A strip's button carries the colour it actually glows, so the choice reads
+   before the label does — and WS2812 shows the whole wheel, which is the point. */
+.pill.led { display: inline-flex; align-items: center; gap: var(--space-2); }
+.led-dot { width: 9px; height: 9px; flex: 0 0 auto; border-radius: 50%; }
+/* The colour an addressable mode is built around — swatches plus a picker for
+   anything else, because six is enough for a click and never enough for a brief. */
+.led-colours { display: flex; flex-wrap: wrap; gap: var(--space-2); margin: var(--space-4) 0; }
+.led-colour {
+  width: 26px; height: 26px; padding: 0; flex: 0 0 auto;
+  border: 2px solid var(--line); border-radius: var(--radius-sm); cursor: pointer;
+}
+.led-colour:hover { border-color: var(--line-strong); }
+.led-colour.active { border-color: var(--ink); }
+.led-colour.picker { background: none; }
+
+/* The stone catalogue. Each button IS its stone: the chip image is the texture
+   itself, so the grid reads as a sample board rather than as a list of names —
+   which is how anybody actually picks a stone. The label sits in a scrim over
+   the bottom of it, because a name over a mid-grey granite is unreadable
+   otherwise, and the average colour backs the image so the grid still makes
+   sense in the instant before forty thumbnails land. */
+.stone-grid {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(104px, 1fr));
+  gap: var(--space-3); margin: var(--space-4) 0;
+}
+.stone-chip {
+  position: relative; aspect-ratio: 1; padding: 0; overflow: hidden; cursor: pointer;
+  display: flex; flex-direction: column; justify-content: flex-end; gap: 1px;
+  background-size: cover; background-position: center;
+  border: 2px solid var(--line); border-radius: var(--radius-sm);
+  transition: border-color .15s ease, transform .15s ease;
+}
+.stone-chip:hover { border-color: var(--line-strong); transform: translateY(-1px); }
+.stone-chip.active { border-color: var(--ink); }
+.stone-chip.bare { background: var(--surface-2); justify-content: center; align-items: center; }
+.stone-chip .stone-name {
+  font-size: 10px; line-height: 1.25; padding: 0 4px; color: #fff;
+  text-shadow: 0 1px 3px rgba(0,0,0,.95), 0 0 10px rgba(0,0,0,.8);
+}
+.stone-chip .stone-code {
+  font-size: 9px; line-height: 1.2; padding: 0 4px 4px; color: rgba(255,255,255,.78);
+  text-shadow: 0 1px 3px rgba(0,0,0,.95);
+}
+.stone-chip.bare .stone-name, .stone-chip.bare .stone-code { color: var(--muted); text-shadow: none; text-align: center; }
+.stone-chip.bare .stone-name { color: var(--soft-ink); font-size: var(--text-xs); }
 
 .pattern-grid { display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-4); }
 .pattern-card { position: relative; text-align: left; padding: var(--space-4); padding-left: var(--space-5); background: var(--surface-2); border: 1px solid var(--line); border-radius: var(--radius-md); display: flex; flex-direction: column; gap: var(--space-3); min-width: 0; transition: background .15s ease, border-color .15s ease; }
@@ -295,3 +340,71 @@ input[type=range] { flex: 1; min-width: 0; height: var(--control-sm); accent-col
   .fold-control-bar { right: var(--space-6); top: 92px; flex-wrap: wrap; }
   .three-tools { top: var(--space-6); }
 }
+
+/* --- light me up ---------------------------------------------------------- */
+/* The one button that fits the whole lighting kit to the pot on the bench, so
+   it is the only control in the column that reads as an action rather than a
+   setting. Pressed, it turns into its own off switch. */
+.light-me {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 42px;
+  margin-bottom: var(--space-5);
+  padding: 0 var(--space-5);
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-sm);
+  background: var(--accent);
+  color: var(--accent-on);
+  font-size: var(--text-sm);
+  font-weight: 700;
+  cursor: pointer;
+}
+.light-me:hover { filter: brightness(1.08); }
+.light-me.on {
+  background: transparent;
+  border-color: var(--line);
+  color: var(--ink);
+}
+.light-me.on svg { color: #e0a63a; }
+
+/* --- the cut-out toolbar -------------------------------------------------- */
+/* Each button is one facet carrying the pattern it would cut, drawn by the
+   generator itself — so the row is a set of sizes to look at rather than a
+   number whose direction has to be learned. */
+.pattern-picker {
+  display: grid;
+  grid-template-columns: repeat(6, 1fr);
+  gap: 4px;
+  margin: var(--space-4) 0;
+}
+.pattern-option {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 2px 5px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2, var(--surface-1));
+  color: var(--muted);
+  font-size: 9px;
+  font-weight: 650;
+  line-height: 1;
+  cursor: pointer;
+}
+.pattern-option:hover { border-color: var(--accent); color: var(--ink); }
+.pattern-option.active {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: var(--accent-on);
+}
+.swatch { display: block; width: 100%; height: auto; }
+/* Even-odd filled, so the cells punch through and the button's own background
+   shows where the wall is actually open. */
+.swatch-face { fill: currentColor; }
+/* A cut-and-fold petal is severed on two edges only; the swatch shows those
+   two as cuts through the solid rather than as a void. */
+.swatch-slit { fill: none; stroke: var(--surface-1, #fff); stroke-width: 1.1; stroke-linecap: round; }

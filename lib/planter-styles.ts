@@ -62,6 +62,7 @@ export const PLANTER_CATEGORIES: { id: PlanterCategory | 'all'; label: string }[
   { id: 'faceted', label: 'Faceted' },
   { id: 'banded', label: 'Banded' },
   { id: 'column', label: 'Column' },
+  { id: 'lit', label: 'Lit' },
 ];
 
 /**
@@ -205,6 +206,37 @@ export const PLANTER_PRESETS: PlanterPreset[] = [
   {
     id: 'hex-ripple', name: 'Hex Ripple', note: 'Ribbed hexagon, five shallow bands', category: 'column',
     parameters: { style: 'ripple', sides: 6, topDiameter: 330, bottomDiameter: 330, height: 540, rows: 5, rhythm: 30 },
+  },
+
+  // --- Lit: the wall milled open, a soil box behind it, a panel in the collar
+  // The collar runs wide on all of these because it is what the solar panel
+  // beds onto — a catalogue collar is 45 mm and no panel worth fitting lands on
+  // that. The skirt keeps the foot solid, where the pot takes its weight and
+  // where splashback would otherwise go straight through the wall.
+  {
+    id: 'hex-lumen-500', name: 'Hex Lumen 500', note: 'Faceted hexagon milled open, solar-lit', category: 'lit',
+    parameters: {
+      style: 'crystal', sides: 6, topDiameter: 360, bottomDiameter: 300, height: 500, rows: 3,
+      perforation: 'triangles', perfDensity: 2, perfSkirt: 90, rimWidth: 95,
+      liner: true, cavity: 22, solar: true,
+    },
+  },
+  {
+    id: 'hex-lumen-bold', name: 'Hex Lumen Bold', note: 'One big triangle per facet — the widest throw', category: 'lit',
+    parameters: {
+      style: 'crystal', sides: 6, topDiameter: 380, bottomDiameter: 320, height: 520, rows: 2,
+      perforation: 'triangles', perfDensity: 1, perfWeb: 16, perfMargin: 28, perfSkirt: 110, rimWidth: 100,
+      liner: true, cavity: 26, solar: true,
+    },
+  },
+  {
+    id: 'box-lumen-trough', name: 'Lumen Trough', note: 'Lit balcony run, panel on the long side', category: 'lit',
+    parameters: {
+      style: 'prism', footprint: 'rectangle', rows: 2, height: 420,
+      topWidth: 760, topLength: 300, bottomWidth: 700, bottomLength: 250,
+      perforation: 'triangles', perfDensity: 2, perfSkirt: 80, rimWidth: 95,
+      liner: true, cavity: 24, solar: true,
+    },
   },
 ];
 
