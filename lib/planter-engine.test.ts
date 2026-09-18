@@ -11,6 +11,48 @@ const acp = getMaterial('acp-4');
 const build = (overrides: Partial<PlanterParameters> = {}) => buildPlanterModel({ ...DEFAULT_PLANTER, ...overrides });
 const everyPreset = [...PLANTER_PRESETS, BLANK_PLANTER];
 
+/** Narrower span across a piece's opening (mm). */
+const openingWidth = (piece: PlanterPiece) => {
+  const hole = piece.holes[0] ?? [];
+  const xs = hole.map((point) => point.x);
+  const ys = hole.map((point) => point.y);
+  return Math.min(Math.max(...xs) - Math.min(...xs), Math.max(...ys) - Math.min(...ys));
+};
+
+const polygonAreaOf = (points: Vec2[]) => Math.abs(points.reduce((sum, point, i) => {
+  const next = points[(i + 1) % points.length];
+  return sum + (point.x * next.y - next.x * point.y);
+}, 0) / 2);
+
+/**
+ * How far a tab's outer edge is cut back from the end of the fold it hinges on.
+ * The tab is written as the fold's start, then its two outer corners, so the
+ * outline point after the fold's start is the corner the cut-back moved.
+ */
+const tabEndSetback = (piece: PlanterPiece, fold: { x1: number; y1: number; x2: number; y2: number }) => {
+  const a = { x: fold.x1, y: fold.y1 };
+  const span = Math.hypot(fold.x2 - a.x, fold.y2 - a.y) || 1;
+  const dx = (fold.x2 - a.x) / span;
+  const dy = (fold.y2 - a.y) / span;
+  const start = piece.outline.findIndex((point) => Math.hypot(point.x - a.x, point.y - a.y) < 1e-6);
+  if (start < 0) return Number.NaN;
+  const corner = piece.outline[(start + 1) % piece.outline.length];
+  return (corner.x - a.x) * dx + (corner.y - a.y) * dy;
+};
+
+/**
+ * How far each edge of the hole sits off the edge it was stepped in from. The
+ * inset keeps the vertex order, so hole edge i answers to outline edge i.
+ */
+const edgeDistances = (outline: Vec2[], hole: Vec2[]) => hole.map((point, i) => {
+  const next = hole[(i + 1) % hole.length];
+  const mid = { x: (point.x + next.x) / 2, y: (point.y + next.y) / 2 };
+  const a = outline[i];
+  const b = outline[(i + 1) % outline.length];
+  const span = Math.hypot(b.x - a.x, b.y - a.y) || 1;
+  return Math.abs((b.x - a.x) * (a.y - mid.y) - (a.x - mid.x) * (b.y - a.y)) / span;
+});
+
 /** Largest gap between a developed edge and the 3D edge it came from (mm). */
 function isometryError(model: PlanterModel): number {
   const { sides, rows } = model.parameters;
@@ -242,8 +284,74 @@ describe('pieces', () => {
 
   it('opens the collar wider as the rim narrows', () => {
     const hole = (rimWidth: number) =>
-      (build({ rimWidth }).pieces.find((piece) => piece.id === 'rim') as PlanterPiece).circles[0].r;
+      openingWidth(build({ rimWidth }).pieces.find((piece) => piece.id === 'rim') as PlanterPiece);
     expect(hole(30)).toBeGreaterThan(hole(90));
+  });
+
+  it('cuts the collar opening to the pot\'s own shape, not a circle', () => {
+    // A hexagonal pot gets a hexagonal hole and a rectangular one a rectangular
+    // hole, so the collar reads as one band of even width all the way round.
+    for (const [footprint, corners] of [['polygon', 6], ['rectangle', 4]] as const) {
+      const rim = build({ footprint, sides: 6 }).pieces.find((piece) => piece.id === 'rim') as PlanterPiece;
+      expect(rim.holes).toHaveLength(1);
+      expect(rim.holes[0]).toHaveLength(corners);
+    }
+  });
+
+  it('keeps the collar band the same width the whole way round', () => {
+    // The hole is the outline stepped in, so every edge of it sits the rim's
+    // width off the matching edge outside — that is what makes it read as a band.
+    const rim = build({ footprint: 'polygon', sides: 6, rimWidth: 60 }).pieces.find((piece) => piece.id === 'rim') as PlanterPiece;
+    const band = edgeDistances(rim.outline, rim.holes[0]);
+    expect(Math.max(...band) - Math.min(...band)).toBeLessThan(0.5);
+    expect(Math.min(...band)).toBeCloseTo(60, 1);
+  });
+
+  it('leaves an opening however wide the rim is set', () => {
+    for (const rimWidth of [0, 40, 200, 5000]) {
+      const rim = build({ rimWidth }).pieces.find((piece) => piece.id === 'rim') as PlanterPiece;
+      expect(rim.holes[0].length).toBeGreaterThan(2);
+      expect(openingWidth(rim)).toBeGreaterThan(0);
+      expect(polygonAreaOf(rim.holes[0])).toBeLessThan(Math.abs(polygonAreaOf(rim.outline)));
+    }
+  });
+
+  it('mitres the tabs that fold into one plane so they meet instead of overlapping', () => {
+    // Foot tabs all come down into the base plate's plane together. Two tabs on
+    // adjacent edges of the ring want the same material at the corner between
+    // them unless each is cut back by w*tan(pi/n) — 4 mm of relief is nowhere
+    // near that on a hexagon, and the pair jams before either lies flat.
+    for (const sides of [4, 6, 8]) {
+      const model = build({ footprint: sides === 4 ? 'rectangle' : 'polygon', sides, baseTab: 18 });
+      const wall = model.pieces.find((piece) => piece.id === 'wall') as PlanterPiece;
+      const feet = wall.folds.filter((fold) => fold.id.startsWith('foot-'));
+      expect(feet.length).toBeGreaterThan(0);
+      const needed = 18 * Math.tan(Math.PI / model.parameters.sides);
+      for (const fold of feet) {
+        expect(tabEndSetback(wall, fold)).toBeGreaterThanOrEqual(needed - 0.01);
+      }
+    }
+  });
+
+  it('leaves an internal ring joint\'s tabs their full run', () => {
+    // Those fold against the band above, each onto its own facet, so mitring
+    // them back would only throw away rivet land for a clash that cannot happen.
+    const model = build({ construction: 'banded', sides: 6, rows: 3, jointTab: 18 });
+    const band = model.pieces.find((piece) => piece.id === 'band-0') as PlanterPiece;
+    const joints = band.folds.filter((fold) => fold.id.startsWith('joint-'));
+    expect(joints.length).toBeGreaterThan(0);
+    for (const fold of joints) expect(tabEndSetback(band, fold)).toBeLessThan(18 * Math.tan(Math.PI / 6));
+  });
+
+  it('never mitres a tab away to nothing, however sharp the corner', () => {
+    for (const [sides, baseTab] of [[3, 60], [4, 60], [12, 60]] as const) {
+      const model = build({ sides, baseTab, footprint: 'polygon' });
+      const wall = model.pieces.find((piece) => piece.id === 'wall') as PlanterPiece;
+      for (const fold of wall.folds.filter((f) => f.id.startsWith('foot-'))) {
+        expect(Math.hypot(fold.x2 - fold.x1, fold.y2 - fold.y1)).toBeGreaterThan(0);
+        expect(tabEndSetback(wall, fold)).toBeLessThan(Math.hypot(fold.x2 - fold.x1, fold.y2 - fold.y1) / 2);
+      }
+    }
   });
 
   it('adds a seam tab that widens the net and carries a fold per band', () => {
@@ -346,11 +454,13 @@ describe('reporting', () => {
 
 describe('output', () => {
   it('writes millimetre-true SVG carrying the fold notation', () => {
-    const svg = buildPlanterSvg(build(), acp, 'Diamond Relief');
+    const model = build();
+    const svg = buildPlanterSvg(model, acp, 'Diamond Relief');
     expect(svg).toContain('xmlns="http://www.w3.org/2000/svg"');
     expect(svg).toMatch(/width="[\d.]+mm" height="[\d.]+mm"/);
     expect(svg).toContain('Solid = mountain');
-    expect(svg).toContain('<circle'); // the collar opening
+    // One closed contour per piece, plus one more for the collar's opening.
+    expect((svg.match(/<polygon /g) ?? []).length).toBe(model.pieces.length + 1);
   });
 
   it('says in the file which way the pot is built', () => {
@@ -361,9 +471,39 @@ describe('output', () => {
   it('writes DXF R12 with a layer per fold kind', () => {
     const dxf = buildPlanterDxf(build());
     for (const layer of ['CUT', 'MOUNTAIN', 'VALLEY']) expect(dxf).toContain(`\n${layer}\n`);
-    expect(dxf).toContain('\nCIRCLE\n');
     expect(dxf.trimEnd().endsWith('EOF')).toBe(true);
     expect(dxf).not.toMatch(/NaN|Infinity/);
+  });
+
+  it('writes every run as one entity instead of a line per segment', () => {
+    // The reported case: a net exported segment by segment lands on the machine
+    // as hundreds of separate curves, and the cutter lifts between every one.
+    const dxf = buildPlanterDxf(build({ construction: 'single-sheet', sides: 6, rows: 3 }));
+    expect(dxf).not.toContain('\nLINE\n');
+    expect(dxf).toContain('\nPOLYLINE\n');
+    const svg = buildPlanterSvg(build({ construction: 'single-sheet', sides: 6, rows: 3 }), acp, 'Diamond Relief');
+    expect(svg).not.toMatch(/<line /);
+  });
+
+  it('closes each part\'s outline in the file, not by hand afterwards', () => {
+    const model = build();
+    const dxf = buildPlanterDxf(model);
+    // Bit 1 of group 70 is the closed flag; every piece contributes one outline.
+    const closed = dxf.match(/\nPOLYLINE\n8\n[A-Z]+\n66\n1\n70\n1\n/g) ?? [];
+    expect(closed.length).toBeGreaterThanOrEqual(model.pieces.length);
+    expect(buildPlanterSvg(model, acp, 'Diamond Relief')).toContain('<polygon');
+  });
+
+  it('never writes the same crease twice', () => {
+    // Two facets both name the edge between them; grooving it twice burns the
+    // cut twice and doubles the time the part is on the machine.
+    const dxf = buildPlanterDxf(build({ construction: 'banded', sides: 8, rows: 4 }));
+    const runs = [...dxf.matchAll(/\nPOLYLINE\n8\n(\w+)\n[\s\S]*?\nSEQEND\n/g)].map((match) => {
+      const points = [...match[0].matchAll(/VERTEX\n8\n\w+\n10\n([-\d.]+)\n20\n([-\d.]+)\n/g)]
+        .map(([, x, y]) => `${x},${y}`);
+      return `${match[1]}|${points.join(' ')}`;
+    });
+    expect(new Set(runs).size).toBe(runs.length);
   });
 
   it('keeps every exported coordinate inside the nested sheet', () => {

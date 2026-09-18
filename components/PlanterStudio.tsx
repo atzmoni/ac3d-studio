@@ -149,7 +149,7 @@ function usePlanterShell(model: PlanterModel) {
       pieces.push({ tree, crease: internalEdges(ids) });
     }
 
-    const shape = (points: { x: number; y: number }[], hole?: { cx: number; cy: number; r: number }) => {
+    const shape = (points: { x: number; y: number }[], hole?: { x: number; y: number }[]) => {
       const path = new THREE.Shape();
       const cx = points.reduce((sum, point) => sum + point.x, 0) / points.length;
       const cy = points.reduce((sum, point) => sum + point.y, 0) / points.length;
@@ -159,9 +159,14 @@ function usePlanterShell(model: PlanterModel) {
         if (i === 0) path.moveTo(x, y); else path.lineTo(x, y);
       });
       path.closePath();
-      if (hole) {
+      if (hole && hole.length > 2) {
         const ring = new THREE.Path();
-        ring.absarc((hole.cx - cx) * scale, (hole.cy - cy) * scale, hole.r * scale, 0, Math.PI * 2, true);
+        hole.forEach((point, i) => {
+          const x = (point.x - cx) * scale;
+          const y = (point.y - cy) * scale;
+          if (i === 0) ring.moveTo(x, y); else ring.lineTo(x, y);
+        });
+        ring.closePath();
         path.holes.push(ring);
       }
       return new THREE.ShapeGeometry(path);
@@ -172,39 +177,71 @@ function usePlanterShell(model: PlanterModel) {
     const basePiece = model.pieces.find((piece) => piece.id === 'base') as PlanterPiece;
     const rimPiece = model.pieces.find((piece) => piece.id === 'rim') as PlanterPiece;
     const base = shape(basePiece.outline);
-    const rim = shape(rimPiece.outline, rimPiece.circles[0]);
+    const rim = shape(rimPiece.outline, rimPiece.holes[0]);
     // ShapeGeometry is drawn in XY. Both plates lie flat in both states, so both
     // get the same quarter turn and only their position has to move.
     base.rotateX(-Math.PI / 2);
     rim.rotateX(-Math.PI / 2);
 
-    // Both plates already sit on the pot's own axis once built, so they start
-    // flat right there too and simply rise or drop into place — not off at
-    // whatever corner of the cutting sheet the nester happened to land them.
     const planeExtent = (piece: PlanterPiece) => Math.hypot(piece.width, piece.height) / 2;
 
     // The camera has to frame both ends of the fold, so the radius is read
     // straight off the flat (t = 0) and built (t = 1) corner positions rather
     // than estimated from the sheet — which no longer positions the pieces at all.
     let extent = 0;
+    const flatBox = { minX: Infinity, maxX: -Infinity, minZ: Infinity, maxZ: -Infinity };
     for (const piece of pieces) {
       for (const tParam of [0, 1]) {
         for (const tri of cornersAt(piece.tree, tParam)) {
           for (const raw of tri) {
             const p = toWorld(raw);
             extent = Math.max(extent, Math.hypot(p.x, p.z), Math.abs(p.y));
+            if (tParam === 0) {
+              flatBox.minX = Math.min(flatBox.minX, p.x);
+              flatBox.maxX = Math.max(flatBox.maxX, p.x);
+              flatBox.minZ = Math.min(flatBox.minZ, p.z);
+              flatBox.maxZ = Math.max(flatBox.maxZ, p.z);
+            }
           }
         }
       }
     }
 
+    // Laid out flat, the plates are separate parts and have to read as separate
+    // parts: stacked on the wall's own footprint they just hide inside it. They
+    // sit in a row beside the wall blank and travel to the axis as the fold runs.
+    const baseHalf = (basePiece.width / 2) * scale;
+    const rimHalf = (rimPiece.width / 2) * scale;
+    const gap = Math.max(baseHalf, rimHalf, POT_FIT * 0.1) * 0.35;
+    const wallRight = Number.isFinite(flatBox.maxX) ? flatBox.maxX : 0;
+    const alongZ = Number.isFinite(flatBox.minZ) ? (flatBox.minZ + flatBox.maxZ) / 2 : 0;
+    const baseX = wallRight + gap + baseHalf;
+    const rimX = baseX + baseHalf + gap + rimHalf;
+    extent = Math.max(extent, Math.hypot(rimX + rimHalf, alongZ + rimHalf));
+
+    // What a plant standing in the opening has to clear is the largest circle
+    // that fits it — the hole's inradius, not its corner-to-corner span.
+    const hole = rimPiece.holes[0] ?? [];
+    const holeCentre = {
+      x: hole.reduce((sum, point) => sum + point.x, 0) / (hole.length || 1),
+      y: hole.reduce((sum, point) => sum + point.y, 0) / (hole.length || 1),
+    };
+    let opening = Infinity;
+    for (let i = 0; i < hole.length; i += 1) {
+      const a = hole[i];
+      const b = hole[(i + 1) % hole.length];
+      const span = Math.hypot(b.x - a.x, b.y - a.y) || 1;
+      const drop = Math.abs((b.x - a.x) * (a.y - holeCentre.y) - (a.x - holeCentre.x) * (b.y - a.y)) / span;
+      opening = Math.min(opening, drop);
+    }
+
     return {
       pieces, scale, base, rim,
-      baseFlat: new THREE.Vector3(0, 0, 0),
+      baseFlat: new THREE.Vector3(baseX, 0, alongZ),
       baseBuilt: new THREE.Vector3(0, 0.001, 0),
-      rimFlat: new THREE.Vector3(0, 0, 0),
+      rimFlat: new THREE.Vector3(rimX, 0, alongZ),
       rimBuilt: new THREE.Vector3(0, height * scale, 0),
-      openingRadius: (rimPiece.circles[0]?.r ?? 0) * scale,
+      openingRadius: (Number.isFinite(opening) ? opening : 0) * scale,
       radius: Math.max(POT_FIT, extent, planeExtent(basePiece) * scale, planeExtent(rimPiece) * scale) * 1.15,
     };
   }, [model]);
@@ -574,7 +611,7 @@ function PlanterNet({ model, thumb = false }: { model: PlanterModel; thumb?: boo
           />
         )}
         {pieces.map((piece) => {
-          const { outline, folds, circles } = placedGeometry(piece);
+          const { outline, folds, holes } = placedGeometry(piece);
           return (
             <g key={piece.id}>
               <polygon
@@ -582,9 +619,10 @@ function PlanterNet({ model, thumb = false }: { model: PlanterModel; thumb?: boo
                 fill="rgba(120,132,168,0.09)"
                 stroke={FOLD_COLORS.cut} strokeWidth={weight} strokeDasharray={STROKE_DASH.cut}
               />
-              {circles.map((circle, i) => (
-                <circle
-                  key={i} cx={circle.cx} cy={circle.cy} r={circle.r}
+              {holes.map((hole, i) => (
+                <polygon
+                  key={i} points={hole.map((point) => `${point.x.toFixed(2)},${point.y.toFixed(2)}`).join(' ')}
+                  fill="var(--surface-0, #0d0f16)"
                   stroke={FOLD_COLORS.cut} strokeWidth={weight} strokeDasharray={STROKE_DASH.cut}
                 />
               ))}
@@ -807,7 +845,7 @@ export default function PlanterStudio({ onStatus }: { onStatus?: (status: Studio
           <SliderField label="Base inset" value={parameters.baseInset} min={0} max={20} step={1} suffix="mm" onChange={(value) => update('baseInset', value)} />
           <SliderField label="Base tab" value={parameters.baseTab} min={0} max={60} step={1} suffix="mm" onChange={(value) => update('baseTab', value)} />
           <SliderField label="Collar tab" value={parameters.rimTab} min={0} max={60} step={1} suffix="mm" onChange={(value) => update('rimTab', value)} />
-          <p className="field-hint tech-data">Planting hole {stats.topOpening} ⌀</p>
+          <p className="field-hint tech-data">Planting hole {stats.topOpening}</p>
         </div>
 
         <div className="sidebar-section">

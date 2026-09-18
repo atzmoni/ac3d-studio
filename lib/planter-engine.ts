@@ -1,5 +1,6 @@
 import { getMaterial } from './pattern-engine';
 import { getPlanterStyle } from './planter-styles';
+import { chainFoldLines, simplifyPolyline, type Polyline } from './polyline';
 import type {
   FabricationCheck, FoldKind, FoldLine, MaterialSpec, PlanterModel, PlanterParameters,
   PlanterPiece, PlanterStats, Vec2, Vec3,
@@ -15,6 +16,8 @@ const NEST_GAP = 15;
 const FLAT_CREASE = 0.5;
 /** Relief cut at each end of a joint tab so neighbouring tabs clear each other (mm). */
 const TAB_RELIEF = 4;
+/** The collar keeps at least this much opening, however wide the rim is set (mm). */
+const MIN_OPENING = 15;
 
 export const DEFAULT_PLANTER: PlanterParameters = {
   style: 'diamond',
@@ -421,7 +424,7 @@ function wallEdges(triangles: Triangle[], rings: Vec3[][], stride: number): Wall
 
 /** Shift a piece into its own local frame and record the box it occupies. */
 function finishPiece(
-  id: string, label: string, outline: Vec2[], folds: FoldLine[], circles: PlanterPiece['circles'],
+  id: string, label: string, outline: Vec2[], folds: FoldLine[], holes: Vec2[][],
 ): PlanterPiece {
   const box = bounds(outline);
   const origin = { x: box.minX, y: box.minY };
@@ -438,7 +441,7 @@ function finishPiece(
       ...fold,
       x1: fold.x1 - origin.x, y1: fold.y1 - origin.y, x2: fold.x2 - origin.x, y2: fold.y2 - origin.y,
     })),
-    circles: circles.map((circle) => ({ ...circle, cx: circle.cx - origin.x, cy: circle.cy - origin.y })),
+    holes: holes.map((hole) => hole.map((point) => ({ x: point.x - origin.x, y: point.y - origin.y }))),
   };
 }
 
@@ -479,12 +482,30 @@ function seamTab(seam: Vec2[], body: Vec2[], width: number): { outline: Vec2[]; 
 }
 
 /**
+ * How far a tab is cut back at each end.
+ *
+ * Tabs that fold in to lie in one plane — the foot's under the base plate, the
+ * mouth's under the collar — all arrive in that plane together, and at every
+ * corner of the ring two neighbours want the same material. Mitring each back by
+ * `w · tan(π/n)` lands them on the corner bisector, meeting instead of fighting;
+ * `TAB_RELIEF` on top is the gap they need to clear each other coming down.
+ *
+ * A tab that folds against the wall above it instead lands on its own facet, so
+ * a neighbour on the next facet is already out of its way — that one only needs
+ * the clearance, which is what `TAB_RELIEF` alone gives.
+ */
+function mitreRelief(width: number, sides: number): number {
+  return width * Math.tan(Math.PI / Math.max(3, sides)) + TAB_RELIEF;
+}
+
+/**
  * Rivet tabs along a ring joint, walked in the direction `line` is given in. One
  * tab per segment rather than a single flange: a staggered ring develops as a
  * zigzag, and a flange can only fold along a straight line — so each segment gets
- * its own tab, with a relief gap so neighbours clear each other as they fold in.
+ * its own tab, cut back at both ends by `relief` so neighbours clear each other
+ * as they fold in.
  */
-function jointTabs(line: Vec2[], body: Vec2[], width: number): { outline: Vec2[]; folds: Vec2[][] } {
+function jointTabs(line: Vec2[], body: Vec2[], width: number, relief: number): { outline: Vec2[]; folds: Vec2[][] } {
   if (width <= 0.5) return { outline: line.slice(), folds: [] };
   const outline: Vec2[] = [];
   const folds: Vec2[][] = [];
@@ -493,7 +514,8 @@ function jointTabs(line: Vec2[], body: Vec2[], width: number): { outline: Vec2[]
     const a = line[i];
     const b = line[i + 1];
     const length = dist2(a, b) || EPSILON;
-    const relief = Math.min(TAB_RELIEF, length * 0.18);
+    // Whatever the corner asks for, the tab has to survive it.
+    const cut = Math.min(relief, length * 0.45);
     const dirX = (b.x - a.x) / length;
     const dirY = (b.y - a.y) / length;
     let nx = -dirY;
@@ -501,8 +523,8 @@ function jointTabs(line: Vec2[], body: Vec2[], width: number): { outline: Vec2[]
     const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
     if (nx * (body[i].x - mid.x) + ny * (body[i].y - mid.y) > 0) { nx = -nx; ny = -ny; }
     outline.push(a);
-    outline.push({ x: a.x + nx * width + dirX * relief, y: a.y + ny * width + dirY * relief });
-    outline.push({ x: b.x + nx * width - dirX * relief, y: b.y + ny * width - dirY * relief });
+    outline.push({ x: a.x + nx * width + dirX * cut, y: a.y + ny * width + dirY * cut });
+    outline.push({ x: b.x + nx * width - dirX * cut, y: b.y + ny * width - dirY * cut });
     folds.push([a, b]);
   }
   outline.push(line[line.length - 1]);
@@ -527,10 +549,10 @@ function wallPiece(parameters: PlanterParameters, flat: Vec2[][], edges: WallEdg
   // Foot edge — tabbed inward for the base plate — up the right-hand seam,
   // back along the mouth — also tabbed inward, for the collar — the net is a
   // tube slit open, so its outline is just those runs in order.
-  const foot = jointTabs(flat[0], flat[1], baseTab);
+  const foot = jointTabs(flat[0], flat[1], baseTab, mitreRelief(baseTab, sides));
   const outline: Vec2[] = [...foot.outline];
   for (let k = 1; k <= rows; k += 1) outline.push(flat[k][sides]);
-  const mouth = jointTabs(flat[rows].slice().reverse(), flat[rows - 1].slice().reverse(), rimTab);
+  const mouth = jointTabs(flat[rows].slice().reverse(), flat[rows - 1].slice().reverse(), rimTab, mitreRelief(rimTab, sides));
   outline.push(...mouth.outline.slice(1));
 
   const folds: FoldLine[] = edges
@@ -568,7 +590,9 @@ function bandPiece(
   // Band 0's foot is the wall's actual foot, not an internal joint — tab it
   // inward with `baseTab` so the base plate has something to land on. Every
   // other band's foot stays plain: the band below it already carries the tab.
-  const foot = band === 0 ? jointTabs(below, above, baseTab) : { outline: below.slice(), folds: [] as Vec2[][] };
+  const foot = band === 0
+    ? jointTabs(below, above, baseTab, mitreRelief(baseTab, sides))
+    : { outline: below.slice(), folds: [] as Vec2[][] };
   const outline: Vec2[] = [...foot.outline];
   const folds: FoldLine[] = [...creaseLines(`foot-${band}`, foot.folds, 'valley')];
 
@@ -576,8 +600,13 @@ function bandPiece(
   // `rimTab` so the collar has something to land on, rather than left bare.
   // A distinct id prefix from here on — it rivets to the collar, not to a
   // neighbouring band, so it is not one of the wall's internal `joints`.
+  // The mouth's tabs fold down into the collar's plane alongside each other, so
+  // they mitre; an internal ring joint's fold against the band above, each onto
+  // its own facet, so they only have to clear each other's thickness.
   const isMouth = band === rows - 1;
-  const joint = jointTabs(above, below, isMouth ? rimTab : jointTab);
+  const joint = isMouth
+    ? jointTabs(above, below, rimTab, mitreRelief(rimTab, sides))
+    : jointTabs(above, below, jointTab, TAB_RELIEF);
   outline.push(...joint.outline.slice().reverse());
   folds.push(...creaseLines(isMouth ? `rim-${band}` : `joint-${band}`, joint.folds, 'valley'));
 
@@ -605,10 +634,12 @@ function basePiece(parameters: PlanterParameters, rings: Vec3[][]): PlanterPiece
 
 function rimPiece(parameters: PlanterParameters, rings: Vec3[][]): PlanterPiece {
   const mouth = flatten(rings[parameters.rows], parameters.sides);
-  // Collar width is measured in from the flats, which is where it runs narrowest.
-  const opening = Math.max(15, inradius(mouth) - parameters.rimWidth);
-  const centre = centroid(mouth);
-  return finishPiece('rim', 'Top collar', mouth, [], [{ cx: centre.x, cy: centre.y, r: opening }]);
+  // The opening follows the mouth it is cut from — a hexagonal pot gets a
+  // hexagonal hole, a rectangular one a rectangular hole — so the collar reads as
+  // one band of even width rather than a round hole punched through a polygon.
+  // Width is measured in from the flats, which is where that band runs narrowest.
+  const inset = Math.min(parameters.rimWidth, Math.max(0, inradius(mouth) - MIN_OPENING));
+  return finishPiece('rim', 'Top collar', mouth, [], [insetConvex(mouth, inset)]);
 }
 
 interface Layout { pieces: PlanterPiece[]; sheet: { width: number; height: number } }
@@ -802,15 +833,16 @@ export function getPlanterStats(model: PlanterModel, material: MaterialSpec): Pl
     0,
   );
   const cutLength = model.pieces.reduce(
-    (sum, piece) => sum + perimeter(piece.outline) + piece.circles.reduce((run, circle) => run + TAU * circle.r, 0),
+    (sum, piece) => sum + perimeter(piece.outline) + piece.holes.reduce((run, hole) => run + perimeter(hole), 0),
     0,
   );
   const sheetArea = model.pieces.reduce(
     (sum, piece) => sum + Math.abs(polygonArea(piece.outline))
-      - piece.circles.reduce((hole, circle) => hole + Math.PI * circle.r * circle.r, 0),
+      - piece.holes.reduce((cut, hole) => cut + Math.abs(polygonArea(hole)), 0),
     0,
   );
-  const rim = model.pieces.find((piece) => piece.id === 'rim');
+  const rimHole = model.pieces.find((piece) => piece.id === 'rim')?.holes[0];
+  const opening = rimHole ? bounds(rimHole) : { minX: 0, maxX: 0, minY: 0, maxY: 0 };
   const widest = model.vertices.reduce((best, ring) => {
     const box = bounds(flatten(ring, sides));
     const size = { width: box.maxX - box.minX, height: box.maxY - box.minY };
@@ -826,7 +858,7 @@ export function getPlanterStats(model: PlanterModel, material: MaterialSpec): Pl
       : `${Math.ceil(model.sheet.width)} × ${Math.ceil(model.sheet.height)} mm`,
     estimatedWeight: `${(sheetArea * material.thickness * material.density).toFixed(2)} kg`,
     volume: `≈ ${planterVolumeLitres(model).toFixed(1)} L`,
-    topOpening: `${Math.round((rim?.circles[0]?.r ?? 0) * 2)} mm`,
+    topOpening: `${Math.round(opening.maxX - opening.minX)} × ${Math.round(opening.maxY - opening.minY)} mm`,
     footprint: `${Math.round(widest.width)} × ${Math.round(widest.height)} mm`,
     pieces: model.pieces.length,
     sheets: model.sheets,
@@ -960,8 +992,25 @@ export function placedGeometry(piece: PlanterPiece) {
       ...fold,
       x1: fold.x1 + piece.x, y1: fold.y1 + piece.y, x2: fold.x2 + piece.x, y2: fold.y2 + piece.y,
     })),
-    circles: piece.circles.map((circle) => ({ ...circle, cx: circle.cx + piece.x, cy: circle.cy + piece.y })),
+    holes: piece.holes.map((hole) => hole.map((point) => ({ x: point.x + piece.x, y: point.y + piece.y }))),
   };
+}
+
+const FOLD_KINDS: FoldKind[] = ['mountain', 'valley', 'cut'];
+
+/** Dash lengths are millimetres in an export, not screen pixels as on the canvas. */
+const SVG_DASH: Record<FoldKind, string> = {
+  mountain: '', valley: ' stroke-dasharray="14 8"', cut: ' stroke-dasharray="18 6 4 6"',
+};
+
+/**
+ * One run as one element: `polygon` where the run closes, so it arrives as a
+ * closed path rather than an open one somebody has to join by hand.
+ */
+function svgRun(run: Polyline, kind: FoldKind): string {
+  const points = run.points.map((point) => `${point.x.toFixed(2)},${point.y.toFixed(2)}`).join(' ');
+  const width = kind === 'cut' ? 0.4 : 0.3;
+  return `<${run.closed ? 'polygon' : 'polyline'} points="${points}" stroke="${FOLD_COLORS[kind]}" stroke-width="${width}"${SVG_DASH[kind]}/>`;
 }
 
 /** 1:1 millimetre SVG of the whole nested sheet, notation and shop notes included. */
@@ -971,16 +1020,16 @@ export function buildPlanterSvg(model: PlanterModel, material: MaterialSpec, sty
   const annotation: string[] = [];
 
   for (const piece of model.pieces) {
-    const { outline, folds, circles } = placedGeometry(piece);
-    const points = outline.map((point) => `${point.x.toFixed(2)},${point.y.toFixed(2)}`).join(' ');
-    body.push(`<polygon points="${points}" stroke="${FOLD_COLORS.cut}" stroke-width="0.4" stroke-dasharray="18 6 4 6"/>`);
-    for (const circle of circles) {
-      body.push(`<circle cx="${circle.cx.toFixed(2)}" cy="${circle.cy.toFixed(2)}" r="${circle.r.toFixed(2)}" stroke="${FOLD_COLORS.cut}" stroke-width="0.4" stroke-dasharray="18 6 4 6"/>`);
+    // Joined piece by piece: two parts that happen to touch in the nest are still
+    // two parts, and running their outlines together would cut them as one.
+    const { outline, folds, holes } = placedGeometry(piece);
+    body.push(svgRun(simplifyPolyline({ points: outline, closed: true }), 'cut'));
+    for (const hole of holes) {
+      body.push(svgRun(simplifyPolyline({ points: hole, closed: true }), 'cut'));
     }
-    for (const fold of folds) {
-      // Dash lengths are millimetres here, not screen pixels as on the canvas.
-      const dash = fold.kind === 'valley' ? ' stroke-dasharray="14 8"' : '';
-      body.push(`<line x1="${fold.x1.toFixed(2)}" y1="${fold.y1.toFixed(2)}" x2="${fold.x2.toFixed(2)}" y2="${fold.y2.toFixed(2)}" stroke="${FOLD_COLORS[fold.kind]}" stroke-width="0.3"${dash}/>`);
+    for (const kind of FOLD_KINDS) {
+      const runs = chainFoldLines(folds.filter((fold) => fold.kind === kind));
+      for (const run of runs) body.push(svgRun(run, kind));
     }
     // Labels live in a y-up group, so each is flipped back the right way round.
     annotation.push(`<text x="${(piece.x + 6).toFixed(2)}" y="${(-(piece.y + 12)).toFixed(2)}" font-size="14" fill="#9aa2b4" transform="scale(1,-1)">${piece.label}</text>`);
@@ -1017,7 +1066,11 @@ const pair = (code: number, value: string | number): string => `${code}\n${value
 
 /**
  * DXF R12 — the format every router control still reads without argument. One
- * layer per fold kind, so cuts and grooves can be sent to different tools.
+ * layer per fold kind, so cuts and grooves can be sent to different tools, and
+ * one POLYLINE per run rather than a LINE per segment: a control treats every
+ * entity as its own move, so a crease written segment by segment is cut as a row
+ * of stabs. R12's POLYLINE/VERTEX/SEQEND is bulkier than a later LWPOLYLINE but
+ * is what the old controls read, which is the reason to be writing R12 at all.
  */
 export function buildPlanterDxf(model: PlanterModel): string {
   let out = pair(0, 'SECTION') + pair(2, 'TABLES') + pair(0, 'TABLE') + pair(2, 'LAYER') + pair(70, 3);
@@ -1026,23 +1079,29 @@ export function buildPlanterDxf(model: PlanterModel): string {
   }
   out += pair(0, 'ENDTAB') + pair(0, 'ENDSEC') + pair(0, 'SECTION') + pair(2, 'ENTITIES');
 
-  const line = (layer: string, a: Vec2, b: Vec2) =>
-    pair(0, 'LINE') + pair(8, layer)
-    + pair(10, a.x.toFixed(3)) + pair(20, a.y.toFixed(3)) + pair(30, '0.0')
-    + pair(11, b.x.toFixed(3)) + pair(21, b.y.toFixed(3)) + pair(31, '0.0');
+  // 66 marks the vertices as following; bit 1 of 70 is what makes the run closed,
+  // so a closed contour needs no joining up after it lands on the shop machine.
+  const polyline = (layer: string, run: Polyline) => {
+    let entity = pair(0, 'POLYLINE') + pair(8, layer) + pair(66, 1) + pair(70, run.closed ? 1 : 0)
+      + pair(10, '0.0') + pair(20, '0.0') + pair(30, '0.0');
+    for (const point of run.points) {
+      entity += pair(0, 'VERTEX') + pair(8, layer)
+        + pair(10, point.x.toFixed(3)) + pair(20, point.y.toFixed(3)) + pair(30, '0.0');
+    }
+    return entity + pair(0, 'SEQEND') + pair(8, layer);
+  };
 
   for (const piece of model.pieces) {
-    const { outline, folds, circles } = placedGeometry(piece);
-    for (let i = 0; i < outline.length; i += 1) {
-      out += line(DXF_LAYERS.cut.name, outline[i], outline[(i + 1) % outline.length]);
+    // Joined piece by piece: two parts that happen to touch in the nest are still
+    // two parts, and running their outlines together would cut them as one.
+    const { outline, folds, holes } = placedGeometry(piece);
+    out += polyline(DXF_LAYERS.cut.name, simplifyPolyline({ points: outline, closed: true }));
+    for (const hole of holes) {
+      out += polyline(DXF_LAYERS.cut.name, simplifyPolyline({ points: hole, closed: true }));
     }
-    for (const circle of circles) {
-      out += pair(0, 'CIRCLE') + pair(8, DXF_LAYERS.cut.name)
-        + pair(10, circle.cx.toFixed(3)) + pair(20, circle.cy.toFixed(3)) + pair(30, '0.0')
-        + pair(40, circle.r.toFixed(3));
-    }
-    for (const fold of folds) {
-      out += line(DXF_LAYERS[fold.kind].name, { x: fold.x1, y: fold.y1 }, { x: fold.x2, y: fold.y2 });
+    for (const kind of FOLD_KINDS) {
+      const runs = chainFoldLines(folds.filter((fold) => fold.kind === kind));
+      for (const run of runs) out += polyline(DXF_LAYERS[kind].name, run);
     }
   }
   return `${out}${pair(0, 'ENDSEC')}${pair(0, 'EOF')}`;

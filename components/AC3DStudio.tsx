@@ -9,6 +9,7 @@ import { CheckList, NumberField, SliderField } from '@/components/controls';
 import PlanterStudio, { type StudioStatus } from '@/components/PlanterStudio';
 import { CameraRig, StudioLights } from '@/components/three-stage';
 import { getPattern, PATTERNS } from '@/lib/patterns';
+import { chainFoldLines } from '@/lib/polyline';
 import {
   buildFoldLines, DEFAULT_PARAMETERS, getCellDimensions, getFabricationChecks, getFoldedGrid, getFoldMechanics,
   getMaterial, getPatternStats, MATERIALS,
@@ -431,10 +432,16 @@ export default function AC3DStudio() {
 
   const exportSvg = () => {
     const lines = buildFoldLines(patternId, parameters);
-    const markup = lines.map((line) => {
+    // One element per continuous run, not per segment: the cutter treats every
+    // element as its own move, so a crease split facet by facet is cut as a row
+    // of stabs instead of one pass.
+    const markup = (['mountain', 'valley', 'cut'] as FoldKind[]).flatMap((kind) => {
       // Dash lengths are in millimetres here, not screen pixels as on the canvas.
-      const dash = line.kind === 'valley' ? ' stroke-dasharray="14 8"' : line.kind === 'cut' ? ' stroke-dasharray="18 6 4 6"' : '';
-      return `<line x1="${line.x1.toFixed(2)}" y1="${line.y1.toFixed(2)}" x2="${line.x2.toFixed(2)}" y2="${line.y2.toFixed(2)}" stroke="${foldColor(line.kind)}" stroke-width="${line.kind === 'cut' ? 0.4 : 0.3}"${dash}/>`;
+      const dash = kind === 'valley' ? ' stroke-dasharray="14 8"' : kind === 'cut' ? ' stroke-dasharray="18 6 4 6"' : '';
+      return chainFoldLines(lines.filter((line) => line.kind === kind)).map((run) => {
+        const points = run.points.map((point) => `${point.x.toFixed(2)},${point.y.toFixed(2)}`).join(' ');
+        return `<${run.closed ? 'polygon' : 'polyline'} points="${points}" stroke="${foldColor(kind)}" stroke-width="${kind === 'cut' ? 0.4 : 0.3}"${dash}/>`;
+      });
     }).join('');
     const notes = [
       `${pattern.name} — ${parameters.panelWidth} × ${parameters.panelHeight} mm flat`,

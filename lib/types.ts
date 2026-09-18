@@ -239,8 +239,8 @@ export interface PlanterPiece {
   /** Local coordinates, closed implicitly (last point joins the first). */
   outline: Vec2[];
   folds: FoldLine[];
-  /** Cut-outs — the collar's planting hole. */
-  circles: { cx: number; cy: number; r: number }[];
+  /** Cut-outs — the collar's planting hole. Closed like `outline`. */
+  holes: Vec2[][];
 }
 
 export interface PlanterModel {
