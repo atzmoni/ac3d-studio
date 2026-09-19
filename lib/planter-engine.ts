@@ -19,10 +19,10 @@ import {
 import { getPlanterStyle } from './planter-styles';
 import { chainFoldLines, simplifyPolyline, type Polyline } from './polyline';
 import type {
-  FabricationCheck, FoldKind, FoldLine, MaterialSpec, PlanterLed, PlanterLedController,
-  PlanterLedEffect, PlanterLedPosition, PlanterLighting, PlanterLiner,
-  PlanterModel, PlanterParameters, PlanterPerfCells, PlanterPerforation, PlanterPiece,
-  PlanterPrintJob, PlanterStats, PlanterStoneCoat,
+  FabricationCheck, FoldKind, FoldLine, MaterialSpec, PlanterConstruction, PlanterGroove, PlanterLed,
+  PlanterLedController, PlanterLedEffect, PlanterLedPosition, PlanterLighting, PlanterLiner,
+  PlanterFace, PlanterModel, PlanterParameters, PlanterPerfCells, PlanterPerforation, PlanterPiece,
+  PlanterPrintJob, PlanterStats, PlanterStoneCoat, PlanterWallPart,
   Vec2, Vec3,
 } from './types';
 
@@ -38,6 +38,35 @@ const FLAT_CREASE = 0.5;
 const TAB_RELIEF = 4;
 /** The collar keeps at least this much opening, however wide the rim is set (mm). */
 const MIN_OPENING = 15;
+/**
+ * Slip the base plate needs past the inside of the wall to actually drop in (mm).
+ *
+ * Small, because it is a fit and not a gap — the plate lands on the foot tabs
+ * and the wall closes round it. Too much and the pot leaks soil at the floor.
+ */
+const BASE_FIT = 0.6;
+/**
+ * Steepest mitre the inside face is allowed to be pushed out to.
+ *
+ * Offsetting a surface inward runs away at a sharp corner: the mitre length is
+ * the thickness over the cosine of the half-angle, so a crease approaching 180
+ * degrees of bend sends the inside corner to infinity. Real stock does not do
+ * that — it bottoms out when the groove shuts. 3 caps the run-out at three
+ * thicknesses, well past anything a fold this side of a hem reaches.
+ */
+const MITRE_LIMIT = 3;
+/**
+ * How much edge mismatch a blank may carry and still be called foldable (mm).
+ *
+ * The stock does not stretch, so the honest figure is zero and everything above
+ * it is a gap somebody closes by force on the bench. This is the width of the
+ * rivet's own slop, which is what lets a tenth of a millimetre pass without a
+ * warning; `planWallParts` cuts to stay under it, and the development check
+ * fires above it, so the two can never disagree about what is buildable.
+ */
+export const DEVELOPMENT_TOLERANCE = 0.8;
+/** The construction modes that exist, for guarding a design loaded from anywhere. */
+const CONSTRUCTIONS: PlanterConstruction[] = ['single-sheet', 'split', 'banded'];
 
 // --- Lighting ---------------------------------------------------------------
 
@@ -100,6 +129,10 @@ export const DEFAULT_PLANTER: PlanterParameters = {
   style: 'diamond',
   footprint: 'polygon',
   construction: 'single-sheet',
+  material: 'acp-4',
+  // Every crease grooved with the bit it needs. Fit a real one and the checks
+  // start saying which creases it can and cannot close.
+  vBitAngle: 0,
   sides: 6,
   topDiameter: 400,
   bottomDiameter: 330,
@@ -115,7 +148,10 @@ export const DEFAULT_PLANTER: PlanterParameters = {
   tabWidth: 25,
   jointTab: 20,
   rimWidth: 45,
-  baseInset: 3,
+  // One thickness of the house sheet plus its working fit — the smallest inset
+  // that actually drops through the hole it is cut for. `normalizePlanter` holds
+  // the floor for every other stock.
+  baseInset: 4.6,
   baseTab: 18,
   rimTab: 18,
   // Every lighting lever starts off: a pot that was solid yesterday cuts the
@@ -199,8 +235,20 @@ function snap(value: number, steps: number[]): number {
 /** Every field is slider- or keyboard-driven, so nothing downstream may assume a sane value. */
 export function normalizePlanter(parameters: PlanterParameters): PlanterParameters {
   const span = (value: number) => clamp(Math.abs(value), 60, 4000);
+  // Resolved before the rest, because the stock decides what some of the other
+  // fields are even allowed to be. A design saved before the field existed
+  // arrives with it undefined and gets the house sheet.
+  const material = getMaterial(parameters.material);
   return {
     ...parameters,
+    material: material.id,
+    // 0 is the auto bit — every crease grooved with the angle it needs. Anything
+    // else is one real bit, and 20-170 is the range one can be ground to.
+    vBitAngle: parameters.vBitAngle > 0 ? clamp(parameters.vBitAngle, 20, 170) : 0,
+    // A saved design predates whatever construction modes exist today, so an
+    // unknown one falls back to the single blank rather than planning a split
+    // nobody asked for.
+    construction: CONSTRUCTIONS.includes(parameters.construction) ? parameters.construction : 'single-sheet',
     // A rectangle has four corners by definition; the slider does not get a say.
     sides: parameters.footprint === 'rectangle' ? 4 : Math.round(clamp(parameters.sides, 3, 12)),
     rows: Math.round(clamp(parameters.rows, 1, 8)),
@@ -217,7 +265,12 @@ export function normalizePlanter(parameters: PlanterParameters): PlanterParamete
     tabWidth: clamp(Math.abs(parameters.tabWidth), 0, 120),
     jointTab: clamp(Math.abs(parameters.jointTab), 0, 120),
     rimWidth: clamp(Math.abs(parameters.rimWidth), 5, 400),
-    baseInset: clamp(Math.abs(parameters.baseInset), 0, 40),
+    // Floored at one thickness plus a working fit, and the slider does not get
+    // a say: the plate is inset from the OUTSIDE of the foot ring, so anything
+    // less than the wall is thick describes a plate that cannot pass the hole
+    // it is meant to drop through. On 4 mm stock a 3 mm inset is 1 mm of steel
+    // short of fitting, and nothing about the drawing would have said so.
+    baseInset: clamp(Math.abs(parameters.baseInset), material.thickness + BASE_FIT, 40),
     baseTab: clamp(Math.abs(parameters.baseTab), 0, 60),
     rimTab: clamp(Math.abs(parameters.rimTab), 0, 60),
     perforation: PERFORATIONS.includes(parameters.perforation) ? parameters.perforation : 'none',
@@ -304,6 +357,8 @@ export function normalizePlanter(parameters: PlanterParameters): PlanterParamete
 
 const sub = (a: Vec3, b: Vec3): Vec3 => ({ x: a.x - b.x, y: a.y - b.y, z: a.z - b.z });
 const dot = (a: Vec3, b: Vec3): number => a.x * b.x + a.y * b.y + a.z * b.z;
+const add3 = (a: Vec3, b: Vec3): Vec3 => ({ x: a.x + b.x, y: a.y + b.y, z: a.z + b.z });
+const scale3 = (a: Vec3, k: number): Vec3 => ({ x: a.x * k, y: a.y * k, z: a.z * k });
 const cross = (a: Vec3, b: Vec3): Vec3 => ({
   x: a.y * b.z - a.z * b.y, y: a.z * b.x - a.x * b.z, z: a.x * b.y - a.y * b.x,
 });
@@ -501,6 +556,137 @@ function planterTriangles(parameters: PlanterParameters, rings: Vec3[][]): Trian
 // Development
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Thickness
+// ---------------------------------------------------------------------------
+
+/**
+ * The inside face of the wall — every vertex pushed in by one thickness.
+ *
+ * Pushing a corner in is not the same as pushing a face in. Offset two facets
+ * that meet at a crease and the offset copies no longer touch: each has moved
+ * along its own normal, and at the crease they cross. The corner that is
+ * actually there is where they cross, which is further in than one thickness by
+ * exactly one over the cosine of the half-angle — the mitre. Ignore it and the
+ * inside of every crease is drawn with a notch out of it and the wall reads as
+ * thinner at the corners than it is anywhere else, which is backwards.
+ *
+ * The distance is taken against the DEEPEST incident facet rather than the
+ * average, so the result is never closer than one thickness to any face it
+ * belongs to: a wall may come out a hair heavy at an awkward corner, never
+ * thinner than the stock it is cut from.
+ */
+function innerVertices(rings: Vec3[][], triangles: Triangle[], stride: number, thickness: number): Vec3[][] {
+  const sides = stride - 1;
+  const at = (id: number) => rings[Math.floor(id / stride)][id % stride];
+  // Column `sides` repeats column 0 at the seam, so the two ids are one physical
+  // corner and have to be mitred as one — otherwise the seam gets two different
+  // inside corners and the wall splits open along it.
+  const key = (id: number) => `${Math.floor(id / stride)}:${(id % stride) % sides}`;
+  const acc = new Map<string, { sum: Vec3; faces: Vec3[] }>();
+
+  for (const triangle of triangles) {
+    const [a, b, c] = triangle.v;
+    for (const [self, u, v] of [[a, b, c], [b, c, a], [c, a, b]] as [number, number, number][]) {
+      // Angle-weighted, so a sliver facet does not pull the corner round as hard
+      // as the broad one beside it does.
+      const e1 = sub(at(u), at(self));
+      const e2 = sub(at(v), at(self));
+      const l1 = Math.hypot(e1.x, e1.y, e1.z);
+      const l2 = Math.hypot(e2.x, e2.y, e2.z);
+      if (l1 < EPSILON || l2 < EPSILON) continue;
+      const weight = Math.acos(clamp(dot(e1, e2) / (l1 * l2), -1, 1));
+      const entry = acc.get(key(self)) ?? { sum: { x: 0, y: 0, z: 0 }, faces: [] };
+      entry.sum = add3(entry.sum, scale3(triangle.normal, weight));
+      entry.faces.push(triangle.normal);
+      acc.set(key(self), entry);
+    }
+  }
+
+  return rings.map((ring, k) => ring.map((point, i) => {
+    const entry = acc.get(`${k}:${i % sides}`);
+    if (!entry || thickness <= 0) return { ...point };
+    const n = unit(entry.sum);
+    if (Math.hypot(n.x, n.y, n.z) < 0.5) return { ...point };
+    const grip = entry.faces.reduce((worst, face) => Math.min(worst, dot(n, face)), 1);
+    const reach = thickness / Math.max(grip, 1 / MITRE_LIMIT);
+    return { x: point.x - n.x * reach, y: point.y - n.y * reach, z: point.z - n.z * reach };
+  }));
+}
+
+/** Volume enclosed by a stack of rings, summed frustum by frustum (mm3). */
+function enclosedVolume(rings: Vec3[][], sides: number, rows: number): number {
+  let volume = 0;
+  for (let k = 0; k < rows; k += 1) {
+    const lower = Math.abs(polygonArea(flatten(rings[k], sides)));
+    const upper = Math.abs(polygonArea(flatten(rings[k + 1], sides)));
+    const rise = rings[k + 1][0].z - rings[k][0].z;
+    volume += (rise / 3) * (lower + upper + Math.sqrt(lower * upper));
+  }
+  return volume;
+}
+
+/**
+ * The biggest circle that fits the tightest facet on the wall, as a radius.
+ *
+ * The honest measure of "how much room is there between one crease and the
+ * next", and the reason it is a circle rather than an edge length: a long thin
+ * sliver and a squat triangle can have the same longest edge and nothing else
+ * in common. A ribbed eight-sided column has facets a fraction of the size a
+ * one-band box has, so anything sized off the pot instead of off this swallows
+ * them whole.
+ */
+function facetInradius(triangles: Triangle[], rings: Vec3[][], stride: number): number {
+  return triangles.reduce((smallest, triangle) => {
+    const [a, b, c] = triangle.v.map((id) => rings[Math.floor(id / stride)][id % stride]);
+    const sides = [dist3(a, b), dist3(b, c), dist3(c, a)];
+    const half = (sides[0] + sides[1] + sides[2]) / 2;
+    const area = Math.sqrt(Math.max(0, half * (half - sides[0]) * (half - sides[1]) * (half - sides[2])));
+    return Math.min(smallest, half > EPSILON ? area / half : 0);
+  }, Infinity);
+}
+
+/** Narrowest way across a ring — what a root ball has to pass, not its diagonal. */
+function ringInradius(ring: Vec2[]): number {
+  const cx = ring.reduce((sum, p) => sum + p.x, 0) / (ring.length || 1);
+  const cy = ring.reduce((sum, p) => sum + p.y, 0) / (ring.length || 1);
+  let least = Infinity;
+  for (let i = 0; i < ring.length; i += 1) {
+    const a = ring[i];
+    const b = ring[(i + 1) % ring.length];
+    const span = Math.hypot(b.x - a.x, b.y - a.y) || 1;
+    least = Math.min(least, Math.abs((b.x - a.x) * (a.y - cy) - (a.x - cx) * (b.y - a.y)) / span);
+  }
+  return Number.isFinite(least) ? least : 0;
+}
+
+/**
+ * What the V-bit does at every crease.
+ *
+ * Depth is fixed by the stock: cut down to the residual skin and no further,
+ * because that skin is the hinge and cutting through it leaves two parts
+ * instead of a fold. Width follows from the depth and the bit, and the bit is
+ * either the one fitted for the job or — at 0 — whatever each crease needs,
+ * in which case the widest cut on the drawing is the one the steepest crease asks
+ * for. Acrylic is not grooved at all: it crazes at a sharp crease and is bent
+ * hot over a former instead, so there the cut is nothing and the fold is a radius.
+ */
+function planterGroove(material: MaterialSpec, bit: number, maxBend: number): PlanterGroove {
+  const heatBent = material.foldMethod === "heat-bend";
+  const depth = heatBent ? 0 : Math.max(0, material.thickness - material.residualSkin);
+  const angle = clamp(bit > 0 ? bit : maxBend, 1, 179);
+  return {
+    depth,
+    width: heatBent ? 0 : 2 * depth * Math.tan((angle / 2) / DEG),
+    skin: heatBent ? material.thickness : Math.min(material.thickness, material.residualSkin),
+    bit,
+    // A V-groove does not fold to a point: it folds over whatever is left under
+    // it. A heat bend folds over the former, which is a bigger radius on purpose.
+    radius: heatBent ? material.minRadius : Math.min(material.thickness, material.residualSkin),
+    heatBent,
+  };
+}
+
 /**
  * Third corner of a triangle given the other two and the two edge lengths it has
  * to keep. Always returns the solution on the positive side of a→b, so a net laid
@@ -560,38 +746,97 @@ function unfoldStrip(unfolder: Unfolder, band: number, flat: (Vec2 | null)[], se
 }
 
 /**
- * Flatten the whole wall as one blank. The bottom band is walked as a strip, so it
- * comes out exactly — a frustum fans into an arc, a staggered band into a zigzag,
- * with no assumption that the foot edge is straight. Every band above it hangs each
- * facet off the ring edge below, which keeps the ring creases exact and stops the
- * closure error of a non-developable design piling up at the seam: it stays spread
- * thinly across the band, where `developmentError` reports it.
+ * Flatten bands `from`..`to` as one blank, returning one row per ring it touches —
+ * `from` up to `to + 1` — in that blank's own frame.
+ *
+ * The lowest band is walked as a strip, so it comes out exactly: a frustum fans
+ * into an arc, a staggered band into a zigzag, with no assumption that the foot
+ * edge is straight. Every band above it hangs each facet off the ring edge below,
+ * which keeps the ring creases exact and stops the closure error of a
+ * non-developable run piling up at the seam: it stays spread thinly across the
+ * band, where `segmentError` reports it.
  */
-function unfoldWall(unfolder: Unfolder): Vec2[][] {
+function unfoldSegment(unfolder: Unfolder, from: number, to: number): Vec2[][] {
   const { triangles, sides, rows } = unfolder;
   const stride = sides + 1;
   const flat: (Vec2 | null)[] = new Array((rows + 1) * stride).fill(null);
 
-  unfoldStrip(unfolder, 0, flat, true);
-  for (let k = 1; k < rows; k += 1) {
+  unfoldStrip(unfolder, from, flat, true);
+  for (let k = from + 1; k <= to; k += 1) {
     for (let i = 0; i < sides; i += 1) placeCorner(unfolder, flat, triangles[(k * sides + i) * 2]);
     for (let i = 0; i < sides; i += 1) placeCorner(unfolder, flat, triangles[((k * sides + i) * 2) + 1]);
   }
 
   const grid: Vec2[][] = [];
-  for (let k = 0; k <= rows; k += 1) {
+  for (let k = from; k <= to + 1; k += 1) {
     grid.push(Array.from({ length: stride }, (_, i) => flat[k * stride + i] ?? { x: 0, y: 0 }));
   }
   return grid;
 }
 
-/** One band flattened on its own, in its own frame: `[below, above]`. */
-function unfoldBand(unfolder: Unfolder, band: number): [Vec2[], Vec2[]] {
-  const stride = unfolder.sides + 1;
-  const flat: (Vec2 | null)[] = new Array((unfolder.rows + 1) * stride).fill(null);
-  unfoldStrip(unfolder, band, flat, true);
-  const row = (k: number) => Array.from({ length: stride }, (_, i) => flat[k * stride + i] ?? { x: 0, y: 0 });
-  return [row(band), row(band + 1)];
+/**
+ * The worst gap, in mm, between an edge of the solid pot and the same edge in a
+ * development of bands `from`..`to`.
+ *
+ * Zero means that run of bands folds exactly out of one blank. Anything else is
+ * material the blank would have to find from somewhere as it closed, and the
+ * stock this shop cuts does not stretch. So this is not a quality score to be
+ * traded off against something else: it is the test of whether the part can be
+ * made at all.
+ */
+function segmentError(unfolder: Unfolder, from: number, to: number): number {
+  const { rings, triangles, sides } = unfolder;
+  const stride = sides + 1;
+  const at = (id: number) => rings[Math.floor(id / stride)][id % stride];
+  const grid = unfoldSegment(unfolder, from, to);
+  const flat = (id: number) => grid[Math.floor(id / stride) - from][id % stride];
+
+  let worst = 0;
+  for (let k = from; k <= to; k += 1) {
+    for (let t = 0; t < sides * 2; t += 1) {
+      const [a, b, c] = triangles[k * sides * 2 + t].v;
+      for (const [p, q] of [[a, b], [b, c], [c, a]] as [number, number][]) {
+        worst = Math.max(worst, Math.abs(dist2(flat(p), flat(q)) - dist3(at(p), at(q))));
+      }
+    }
+  }
+  return worst;
+}
+
+/**
+ * Which runs of bands are cut as separate blanks, low to high and inclusive at
+ * both ends. A single entry spanning every band is a wall that folds out of one
+ * sheet; each extra entry is one more riveted ring joint.
+ *
+ * Curvature on this wall lives at the ring joints. A vertex on a ring in the
+ * middle of a blank is ringed by its own facets, so whatever angle defect the
+ * design left there has nowhere to go and the blank cannot close. Cut that ring
+ * and the same vertices land on an edge of two smaller blanks, free to open by
+ * exactly the defect — which is why a single band always develops, every one of
+ * its vertices being on its boundary.
+ *
+ * So `split` walks up the wall taking the longest run that still develops inside
+ * `DEVELOPMENT_TOLERANCE` and cuts only where the next band would break it.
+ * Extending a run can only add mismatch — the facets already placed do not move
+ * when another band is hung off them — so the greedy run is the longest one
+ * available, and taking the longest run every time gives the fewest parts that
+ * exist. `banded` cuts every joint whether it carries curvature or not: always
+ * safe, and on a gently curved wall two or three rivet lines more than the pot
+ * actually needs.
+ */
+function planWallParts(unfolder: Unfolder, construction: PlanterConstruction): PlanterWallPart[] {
+  const { rows } = unfolder;
+  if (construction === 'banded') return Array.from({ length: rows }, (_, k) => ({ from: k, to: k }));
+  if (construction !== 'split') return [{ from: 0, to: rows - 1 }];
+
+  const parts: PlanterWallPart[] = [];
+  for (let from = 0; from < rows;) {
+    let to = from;
+    while (to + 1 < rows && segmentError(unfolder, from, to + 1) <= DEVELOPMENT_TOLERANCE) to += 1;
+    parts.push({ from, to });
+    from = to + 1;
+  }
+  return parts;
 }
 
 // ---------------------------------------------------------------------------
@@ -751,106 +996,111 @@ function jointTabs(line: Vec2[], body: Vec2[], width: number, relief: number): {
   return { outline, folds };
 }
 
-function creaseLines(prefix: string, pairs: Vec2[][], kind: FoldKind): FoldLine[] {
-  return pairs.map(([a, b], i) => ({ id: `${prefix}-${i}`, kind, x1: a.x, y1: a.y, x2: b.x, y2: b.y }));
+/**
+ * A run of creases that all turn through the same angle.
+ *
+ * Every one of these is a tab or a plate edge, and a tab is folded square so it
+ * has something to rivet through — so unless told otherwise the bend is 90, and
+ * the drawing can name a bit for these lines exactly as it does for the wall.
+ */
+function creaseLines(prefix: string, pairs: Vec2[][], kind: FoldKind, bend = 90): FoldLine[] {
+  return pairs.map(([a, b], i) => ({ id: `${prefix}-${i}`, kind, bend, x1: a.x, y1: a.y, x2: b.x, y2: b.y }));
 }
 
 /**
- * The whole tube as one blank — every ring joint is a crease, not a rivet
- * line. The foot and mouth are not left as plain cut edges, though: the base
- * plate and the collar are separate pieces, and without a tab folding in to
- * meet them there is nothing to rivet or glue either one to.
+ * One run of bands as one blank: the outline the cutter follows, the creases the
+ * V-bit grooves inside it, and nothing in between. A run that covers the whole
+ * wall is the tube slit open, every ring joint a crease; a shorter run stops at a
+ * ring that the design's curvature will not let a blank cross, and that ring
+ * becomes a cut edge with a rivet tab on it.
+ *
+ * Which is the distinction that matters when reading the drawing: a line inside
+ * this outline is grooved and stays attached, and the only lines the cutter parts
+ * are the outline itself. The foot and mouth are not left as plain cut edges
+ * either — the base plate and the collar are separate pieces, and without a tab
+ * folding in to meet them there is nothing to rivet or glue either one to.
  */
-function wallPiece(
-  parameters: PlanterParameters, flat: Vec2[][], edges: WallEdge[], cells: Vec2[][], flaps: Vec2[][],
-): PlanterPiece {
-  const { sides, rows, tabWidth, baseTab, rimTab } = parameters;
-  const stride = sides + 1;
-  const point = (id: number) => flat[Math.floor(id / stride)][id % stride];
-
-  // Foot edge — tabbed inward for the base plate — up the right-hand seam,
-  // back along the mouth — also tabbed inward, for the collar — the net is a
-  // tube slit open, so its outline is just those runs in order.
-  const foot = jointTabs(flat[0], flat[1], baseTab, mitreRelief(baseTab, sides));
-  const outline: Vec2[] = [...foot.outline];
-  for (let k = 1; k <= rows; k += 1) outline.push(flat[k][sides]);
-  const mouth = jointTabs(flat[rows].slice().reverse(), flat[rows - 1].slice().reverse(), rimTab, mitreRelief(rimTab, sides));
-  outline.push(...mouth.outline.slice(1));
-
-  const folds: FoldLine[] = edges
-    .filter((edge) => edge.kind !== 'cut' && edge.bend > FLAT_CREASE)
-    .map((edge, n) => ({
-      id: `wall-${n}`, kind: edge.kind,
-      x1: point(edge.a).x, y1: point(edge.a).y, x2: point(edge.b).x, y2: point(edge.b).y,
-    }));
-  folds.push(...creaseLines('foot', foot.folds, 'valley'));
-  folds.push(...creaseLines('mouth', mouth.folds, 'valley'));
-
-  const tab = seamTab(flat.map((ring) => ring[0]), flat.map((ring) => ring[1]), tabWidth);
-  if (tab.outline.length > 0) {
-    outline.push(...tab.outline);
-    folds.push(...creaseLines('tab', tab.folds, 'valley'));
-  } else {
-    for (let k = rows - 1; k >= 1; k -= 1) outline.push(flat[k][0]);
-  }
-
-  // Each petal hinges on its own crease, bent out by hand after cutting.
-  folds.push(...creaseLines('flap', flaps.map((flap) => [flap[0], flap[1]]), 'mountain'));
-  return finishPiece('wall', 'Wall — fold up', outline, folds, cells, flaps);
-}
-
-/**
- * One band as its own strip. Each band develops exactly on its own, so this is the
- * construction that can build a bulged pot: the curvature a single blank cannot
- * absorb is taken up at the riveted ring joints instead.
- */
-function bandPiece(
-  parameters: PlanterParameters, band: number, below: Vec2[], above: Vec2[], edges: WallEdge[],
-  cells: Vec2[][], flaps: Vec2[][],
+function wallPartPiece(
+  parameters: PlanterParameters, part: PlanterWallPart, parts: number, rings: Vec2[][],
+  edges: WallEdge[], cells: Vec2[][], flaps: Vec2[][],
 ): PlanterPiece {
   const { sides, rows, tabWidth, jointTab, baseTab, rimTab } = parameters;
+  const { from, to } = part;
   const stride = sides + 1;
-  const local = (id: number) => (Math.floor(id / stride) === band ? below : above)[id % stride];
+  const top = rings.length - 1;
+  const ringOf = (id: number) => Math.floor(id / stride);
+  const point = (id: number) => rings[ringOf(id) - from][id % stride];
 
-  // Band 0's foot is the wall's actual foot, not an internal joint — tab it
-  // inward with `baseTab` so the base plate has something to land on. Every
-  // other band's foot stays plain: the band below it already carries the tab.
-  const foot = band === 0
-    ? jointTabs(below, above, baseTab, mitreRelief(baseTab, sides))
-    : { outline: below.slice(), folds: [] as Vec2[][] };
+  // Crease ids are the drawing's layer names, so a wall that came off one blank
+  // keeps the unqualified names it has always had, and a wall in parts qualifies
+  // every name with the band its part starts at — two parts can carry the same
+  // crease of the same facet, and the two are not the same line.
+  const whole = parts === 1;
+  const tag = whole ? '' : `-${from}`;
+
+  // The bottom part's foot is the wall's actual foot, not an internal joint — tab
+  // it inward with `baseTab` so the base plate has something to land on. A part
+  // that starts higher up leaves its foot plain: the part below already carries
+  // the tab that this one rivets to.
+  const foot = from === 0
+    ? jointTabs(rings[0], rings[1], baseTab, mitreRelief(baseTab, sides))
+    : { outline: rings[0].slice(), folds: [] as Vec2[][] };
   const outline: Vec2[] = [...foot.outline];
-  const folds: FoldLine[] = [...creaseLines(`foot-${band}`, foot.folds, 'valley')];
+  const folds: FoldLine[] = [...creaseLines(`foot${tag}`, foot.folds, 'valley')];
 
-  // The last band's mouth is likewise the wall's actual mouth: tabbed with
-  // `rimTab` so the collar has something to land on, rather than left bare.
-  // A distinct id prefix from here on — it rivets to the collar, not to a
-  // neighbouring band, so it is not one of the wall's internal `joints`.
+  // Up the right-hand seam. The top ring is left off — the joint below walks it
+  // back the other way.
+  for (let k = 1; k < top; k += 1) outline.push(rings[k][sides]);
+
+  // The top part's mouth is likewise the wall's actual mouth: tabbed with
+  // `rimTab` so the collar has something to land on, rather than left bare. A
+  // distinct id prefix from here on — it rivets to the collar, not to a
+  // neighbouring part, so it is not one of the wall's internal `joints`.
   // The mouth's tabs fold down into the collar's plane alongside each other, so
-  // they mitre; an internal ring joint's fold against the band above, each onto
+  // they mitre; an internal ring joint's fold against the part above, each onto
   // its own facet, so they only have to clear each other's thickness.
-  const isMouth = band === rows - 1;
+  const isMouth = to === rows - 1;
   const joint = isMouth
-    ? jointTabs(above, below, rimTab, mitreRelief(rimTab, sides))
-    : jointTabs(above, below, jointTab, TAB_RELIEF);
+    ? jointTabs(rings[top], rings[top - 1], rimTab, mitreRelief(rimTab, sides))
+    : jointTabs(rings[top], rings[top - 1], jointTab, TAB_RELIEF);
   outline.push(...joint.outline.slice().reverse());
-  folds.push(...creaseLines(isMouth ? `rim-${band}` : `joint-${band}`, joint.folds, 'valley'));
+  folds.push(...creaseLines(whole ? 'mouth' : `${isMouth ? 'rim' : 'joint'}-${from}`, joint.folds, 'valley'));
 
-  const tab = seamTab([below[0], above[0]], [below[1], above[1]], tabWidth);
-  outline.push(...tab.outline);
-  folds.push(...creaseLines(`tab-${band}`, tab.folds, 'valley'));
+  const tab = seamTab(rings.map((ring) => ring[0]), rings.map((ring) => ring[1]), tabWidth);
+  if (tab.outline.length > 0) {
+    outline.push(...tab.outline);
+    folds.push(...creaseLines(`tab${tag}`, tab.folds, 'valley'));
+  } else {
+    for (let k = top - 1; k >= 1; k -= 1) outline.push(rings[k][0]);
+  }
 
-  // Only the slanted creases inside this band survive. Its two ring edges are cut
-  // lines now, so a fold spanning one of them would be a fold across a joint.
+  // Creases inside this part only. Its own two ring edges are cut lines, so a
+  // fold drawn along one of them would be a fold across a rivet line — which is
+  // exactly the line the preview must not be able to open.
   folds.push(...edges
     .filter((edge) => edge.kind !== 'cut' && edge.bend > FLAT_CREASE)
-    .filter((edge) => Math.floor(edge.a / stride) === band && Math.floor(edge.b / stride) === band + 1)
+    .filter((edge) => {
+      const low = ringOf(edge.a);
+      const high = ringOf(edge.b);
+      if (low < from || high > to + 1) return false;
+      return !(low === high && (low === from || low === to + 1));
+    })
+    // The angle rides on the line itself, not only in a summary. A drawing that
+    // says "fold here" without saying how far cannot be sent to a tool: the bit
+    // has to match the bend or the groove never shuts on itself, and on a
+    // planter every crease bends a different amount.
     .map((edge, n) => ({
-      id: `band${band}-${n}`, kind: edge.kind,
-      x1: local(edge.a).x, y1: local(edge.a).y, x2: local(edge.b).x, y2: local(edge.b).y,
+      id: `${whole ? 'wall' : `band${from}`}-${n}`, kind: edge.kind, bend: edge.bend,
+      x1: point(edge.a).x, y1: point(edge.a).y, x2: point(edge.b).x, y2: point(edge.b).y,
     })));
 
-  folds.push(...creaseLines(`flap-${band}`, flaps.map((flap) => [flap[0], flap[1]]), 'mountain'));
-  return finishPiece(`band-${band}`, `Band ${band + 1} / ${rows}`, outline, folds, cells, flaps);
+  // Each petal hinges on its own crease, bent out by hand after cutting.
+  folds.push(...creaseLines(`flap${tag}`, flaps.map((flap) => [flap[0], flap[1]]), 'mountain'));
+
+  const label = whole
+    ? 'Wall — fold up'
+    : from === to ? `Band ${from + 1} / ${rows}` : `Bands ${from + 1}–${to + 1} / ${rows}`;
+  return finishPiece(whole ? 'wall' : `band-${from}`, label, outline, folds, cells, flaps);
 }
 
 function basePiece(parameters: PlanterParameters, rings: Vec3[][], drained: boolean): PlanterPiece {
@@ -1714,13 +1964,7 @@ export function litPlanter(parameters: PlanterParameters): PlanterParameters {
   // one-band box has, and a border sized off the pot's height swallows them
   // whole — the button then looks like it did nothing, which is how this was
   // found. Sizing off the smallest facet means the pattern survives everywhere.
-  const smallestFacet = planterTriangles(safe, rings).reduce((smallest, triangle) => {
-    const [a, b, c] = triangle.v.map((id) => rings[Math.floor(id / (safe.sides + 1))][id % (safe.sides + 1)]);
-    const sides = [dist3(a, b), dist3(b, c), dist3(c, a)];
-    const half = (sides[0] + sides[1] + sides[2]) / 2;
-    const area = Math.sqrt(Math.max(0, half * (half - sides[0]) * (half - sides[1]) * (half - sides[2])));
-    return Math.min(smallest, half > EPSILON ? area / half : 0);
-  }, Infinity);
+  const smallestFacet = facetInradius(planterTriangles(safe, rings), rings, safe.sides + 1);
 
   const solidFoot = safe.height * 0.18;
   let skirt = 0;
@@ -1757,7 +2001,13 @@ export function litPlanter(parameters: PlanterParameters): PlanterParameters {
   // Step the cavity down until a box will actually go in. A narrower gap than
   // the strip wants is still reported, but it beats no liner at all — and with
   // the wall about to be cut open, the liner is not optional.
-  const fits = (cavity: number) => measureLiner({ ...lit, cavity }, rings, planterTriangles(lit, rings), safe.sides + 1);
+  // Fitted against the INSIDE of the wall, which is the face the box actually
+  // meets. Measured off the outside it would be handed the wall thickness twice
+  // over as free space, and a box cut to that lands hard against the skin with
+  // the strip and its wiring still to go somewhere.
+  const litTriangles = planterTriangles(lit, rings);
+  const litInner = innerVertices(rings, litTriangles, safe.sides + 1, getMaterial(safe.material).thickness);
+  const fits = (cavity: number) => measureLiner({ ...lit, cavity }, litInner, litTriangles, safe.sides + 1);
   const cavity = [safe.cavity, ...CAVITY_STEPS].find((step) => fits(step) !== null);
   const fitted: PlanterParameters = { ...lit, cavity: cavity ?? safe.cavity };
 
@@ -1787,26 +2037,36 @@ export const unlitPlanter = (parameters: PlanterParameters): PlanterParameters =
 export function buildPlanterModel(parameters: PlanterParameters): PlanterModel {
   const safe = normalizePlanter(parameters);
   const stride = safe.sides + 1;
+  const material = getMaterial(safe.material);
+  // 'vertices' is the OUTSIDE face — see 'PlanterSolid'. What the pot actually
+  // contains is measured on the other one.
   const vertices = planterVertices(safe);
   const triangles = planterTriangles(safe, vertices);
+  const inner = innerVertices(vertices, triangles, stride, material.thickness);
   const edges = wallEdges(triangles, vertices, stride);
+  const maxBend = edges.reduce((worst, edge) => (edge.kind === 'cut' ? worst : Math.max(worst, edge.bend)), 0);
   const unfolder: Unfolder = { rings: vertices, triangles, sides: safe.sides, rows: safe.rows };
-  const banded = safe.construction === 'banded';
 
-  // Each wall part carries its own copy of the rings it touches. In single-sheet
-  // construction those copies coincide; in banded construction they are the edges
-  // of two separate parts that meet at a rivet line.
+  // Where the wall is cut into separate blanks, and which part each band belongs
+  // to. One part is the whole tube from one sheet; more than one means rivet
+  // lines, and `planWallParts` is what decides how few of those there can be.
+  const parts = planWallParts(unfolder, safe.construction);
+  const partOf = new Array<number>(safe.rows).fill(0);
+  parts.forEach((part, p) => { for (let k = part.from; k <= part.to; k += 1) partOf[k] = p; });
+
+  // Each part developed in its own frame, then read back band by band. Where two
+  // parts meet, the ring between them exists twice — once as the top edge of the
+  // part below and once as the foot of the part above — and those two copies are
+  // exactly the pair of cut edges that get riveted together.
   //
   // The wall is developed before any part is cut, because the perforation is
   // laid out on the developed facets and the parts are what carry it.
-  const local: Vec2[][][] = [];
-  let grid: Vec2[][] = [];
-  if (banded) {
-    for (let k = 0; k < safe.rows; k += 1) local.push(unfoldBand(unfolder, k));
-  } else {
-    grid = unfoldWall(unfolder);
-    for (let k = 0; k < safe.rows; k += 1) local.push([grid[k], grid[k + 1]]);
-  }
+  const partRings = parts.map((part) => unfoldSegment(unfolder, part.from, part.to));
+  const local: Vec2[][][] = Array.from({ length: safe.rows }, (_, k) => {
+    const rings = partRings[partOf[k]];
+    const base = k - parts[partOf[k]].from;
+    return [rings[base], rings[base + 1]];
+  });
 
   const perBand = safe.sides * 2;
   const perf = perforateWall(
@@ -1814,15 +2074,13 @@ export function buildPlanterModel(parameters: PlanterParameters): PlanterModel {
     (band, id) => local[band][Math.floor(id / stride) - band][id % stride],
   );
 
-  const wallParts: PlanterPiece[] = banded
-    ? local.map((rings, k) => bandPiece(
-      safe, k, rings[0], rings[1], edges,
-      perf.cells.slice(k * perBand, (k + 1) * perBand).flat(),
-      perf.flaps.slice(k * perBand, (k + 1) * perBand).flat(),
-    ))
-    : [wallPiece(safe, grid, edges, perf.cells.flat(), perf.flaps.flat())];
+  const wallParts: PlanterPiece[] = parts.map((part, p) => wallPartPiece(
+    safe, part, parts.length, partRings[p], edges,
+    perf.cells.slice(part.from * perBand, (part.to + 1) * perBand).flat(),
+    perf.flaps.slice(part.from * perBand, (part.to + 1) * perBand).flat(),
+  ));
 
-  const liner = safe.liner ? measureLiner(safe, vertices, triangles, stride) : null;
+  const liner = safe.liner ? measureLiner(safe, inner, triangles, stride) : null;
   const plates = [basePiece(safe, vertices, liner !== null), rimPiece(safe, vertices)];
   if (liner) plates.push(...linerPieces(safe, liner));
 
@@ -1835,10 +2093,10 @@ export function buildPlanterModel(parameters: PlanterParameters): PlanterModel {
   const lighting = measureLighting(safe, vertices, liner, panelCut);
 
   // Wall parts are nested ahead of the plates, so a band's piece is still found
-  // by its index — which is what lets both the rings and the cut-outs be lifted
-  // out of their construction frame by the same shift.
+  // by the index of the part carrying it — which is what lets both the rings and
+  // the cut-outs be lifted out of their construction frame by the same shift.
   const shiftOf = (band: number) => {
-    const piece = pieces[banded ? band : 0];
+    const piece = pieces[partOf[band]];
     return { x: piece.x - piece.origin.x, y: piece.y - piece.origin.y };
   };
 
@@ -1869,16 +2127,35 @@ export function buildPlanterModel(parameters: PlanterParameters): PlanterModel {
     }
   }
 
+  // What it holds, on the face that holds it. The floor is the base plate, one
+  // thickness of stock standing on the foot, and soil does not fill the plate.
+  const shell = enclosedVolume(inner, safe.sides, safe.rows);
+  const floor = Math.abs(polygonArea(flatten(inner[0], safe.sides))) * material.thickness;
+
   return {
     parameters: safe,
+    material,
+    solid: {
+      inner,
+      thickness: material.thickness,
+      litres: Math.max(0, shell - floor) / 1_000_000,
+      surfaceLitres: enclosedVolume(vertices, safe.sides, safe.rows) / 1_000_000,
+      innerOpening: ringInradius(flatten(inner[safe.rows], safe.sides)) * 2,
+      // Real, now that the liner is fitted to the inside face: the box is sized
+      // so its tightest gap is exactly this. Measured off the outside, as it
+      // used to be, a stated 22 mm was 18 mm of actual room on 4 mm stock.
+      cavity: liner ? safe.cavity : null,
+    },
+    groove: planterGroove(material, safe.vBitAngle, maxBend),
     vertices,
     flatByBand,
     triangles,
     pieces,
+    parts,
     sheet,
-    maxBend: edges.reduce((worst, edge) => (edge.kind === 'cut' ? worst : Math.max(worst, edge.bend)), 0),
+    maxBend,
     developmentError,
-    joints: banded ? safe.rows - 1 : 0,
+    joints: parts.length - 1,
     sheets,
     liner,
     lighting,
@@ -1905,17 +2182,15 @@ export function buildPlanterModel(parameters: PlanterParameters): PlanterModel {
 // Reporting
 // ---------------------------------------------------------------------------
 
-/** Enclosed volume, summed frustum by frustum between the rings. */
+/**
+ * What the pot holds (litres) — measured inside the wall, off the floor.
+ *
+ * Worked out once, when the model is built, because it is the inside face that
+ * answers it and the inside face is part of the model. A second sum here would
+ * be a second answer waiting to disagree with the first.
+ */
 export function planterVolumeLitres(model: PlanterModel): number {
-  const { sides, rows } = model.parameters;
-  let volume = 0;
-  for (let k = 0; k < rows; k += 1) {
-    const lower = Math.abs(polygonArea(flatten(model.vertices[k], sides)));
-    const upper = Math.abs(polygonArea(flatten(model.vertices[k + 1], sides)));
-    const rise = model.vertices[k + 1][0].z - model.vertices[k][0].z;
-    volume += (rise / 3) * (lower + upper + Math.sqrt(lower * upper));
-  }
-  return volume / 1_000_000;
+  return model.solid.litres;
 }
 
 /**
@@ -1933,7 +2208,16 @@ const sheetArea = (model: PlanterModel): number => model.pieces.reduce(
 /** What the bare panel weighs, before anybody paints anything onto it (kg). */
 const sheetKg = (model: PlanterModel, material: MaterialSpec): number => sheetArea(model) * material.thickness * material.density;
 
-export function getPlanterStats(model: PlanterModel, material: MaterialSpec): PlanterStats {
+/**
+ * The numbers that go on the quote.
+ *
+ * The stock is read off the model rather than handed in beside it. It used to
+ * be a second argument, which meant a caller could ask what a pot cut from 4 mm
+ * composite weighs while the pot itself had been built from 2 mm steel — two
+ * answers to one question, and no way for either to know it was the wrong one.
+ */
+export function getPlanterStats(model: PlanterModel): PlanterStats {
+  const material = model.material;
   const { sides, rows } = model.parameters;
   const creaseLength = model.pieces.reduce(
     (sum, piece) => sum + piece.folds.reduce((run, fold) => run + Math.hypot(fold.x2 - fold.x1, fold.y2 - fold.y1), 0),
@@ -2021,16 +2305,31 @@ export function getPlanterStats(model: PlanterModel, material: MaterialSpec): Pl
   };
 }
 
+/**
+ * How this wall would be cut if it were built `split`, whatever it is built as
+ * now: the runs of bands that each fold out of one blank.
+ *
+ * It answers the only useful question about a design that will not develop. Not
+ * "is it wrong" — the mismatch already says that — but what it costs to make it
+ * right, counted in parts and rivet lines, before anyone changes a setting.
+ */
+export function planterSplit(model: PlanterModel): PlanterWallPart[] {
+  const { sides, rows } = model.parameters;
+  return planWallParts({ rings: model.vertices, triangles: model.triangles, sides, rows }, 'split');
+}
+
 /** Everything standing between this design and a finished pot, worst first. */
-export function getPlanterChecks(model: PlanterModel, material: MaterialSpec): FabricationCheck[] {
-  const { sides, rows, sheetWidth, sheetHeight, height, rimWidth, construction, jointTab, baseTab, rimTab } = model.parameters;
+/** Everything wrong with this design, on the stock it is actually cut from. */
+export function getPlanterChecks(model: PlanterModel): FabricationCheck[] {
+  const material = model.material;
+  const { sides, rows, sheetWidth, sheetHeight, height, rimWidth, jointTab, baseTab, rimTab } = model.parameters;
   const checks: FabricationCheck[] = [];
   const oversized = model.pieces.find((piece) => !fitsStock(piece.width, piece.height, sheetWidth, sheetHeight));
 
   if (oversized) {
     checks.push({
       id: 'sheet-fit', severity: 'error', title: 'A part is larger than the stock sheet',
-      detail: `${oversized.label} needs ${Math.ceil(oversized.width)} × ${Math.ceil(oversized.height)} mm but the sheet is only ${sheetWidth} × ${sheetHeight} mm. Shrink the pot, drop a band, or switch to banded construction — separate strips are far smaller than one long blank.`,
+      detail: `${oversized.label} needs ${Math.ceil(oversized.width)} × ${Math.ceil(oversized.height)} mm but the sheet is only ${sheetWidth} × ${sheetHeight} mm. Shrink the pot, drop a band, or cut the wall into parts — Split or Banded — because separate strips are far smaller than one long blank.`,
     });
   } else if (model.sheets > 1) {
     checks.push({
@@ -2056,20 +2355,30 @@ export function getPlanterChecks(model: PlanterModel, material: MaterialSpec): F
 
   // Taper, stagger, twist and band height all develop exactly from one blank. A
   // bulge does not: it is curvature, and a curved surface has no flat net at all.
-  // Cutting the wall into bands sidesteps that, because a strip always develops.
-  if (model.developmentError > 0.8) {
-    const bulged = Math.abs(model.parameters.bulge) > 0.5;
-    const culprit = bulged
-      ? 'A bulged wall is curved, so no single blank folds into it. Switch construction to Banded — each band develops exactly and the rings rivet together.'
+  // Cutting the wall at the rings that carry it sidesteps that, because a run of
+  // bands with no curvature crossing it always develops.
+  //
+  // This is an error and not a preference. The stock does not stretch, so the
+  // mismatch below is not a tolerance to be absorbed on the bench: it is the
+  // amount by which the blank is the wrong size for the pot, which also makes
+  // every figure measured off that blank — its area, its weight, its nest —
+  // short by the same mistake.
+  if (model.developmentError > DEVELOPMENT_TOLERANCE) {
+    const culprit = Math.abs(model.parameters.bulge) > 0.5
+      ? 'A bulged wall is curved, so no single blank folds into it.'
       : model.parameters.footprint === 'rectangle' && getPlanterStyle(model.parameters.style).offsetStep > 0
-        ? 'Staggering the rings of a rectangle swings long edges onto short ones, which curves the wall. Square the footprint up, pick the Straight Facet style, or switch to Banded construction.'
+        ? 'Staggering the rings of a rectangle swings long edges onto short ones, which curves the wall. Square the footprint up or pick the Straight Facet style to keep one blank.'
         : model.parameters.rhythm > 1
-          ? 'A band rhythm is free on a straight wall and fights a taper. Straighten the taper, take the rhythm down, or switch to Banded construction.'
-          : 'Ease the taper or the band count, or switch to Banded construction.';
+          ? 'A band rhythm is free on a straight wall and fights a taper. Straighten the taper or take the rhythm down to keep one blank.'
+          : 'Ease the taper or the band count to keep one blank.';
+    const split = planterSplit(model);
+    const cost = split.length === 1
+      ? 'Switch construction to Split and it comes out as one blank after all.'
+      : `Switch construction to Split: ${split.length} parts, ${split.length - 1} riveted ring ${split.length === 2 ? 'joint' : 'joints'}, every other ring still a crease.`;
     checks.push({
-      id: 'development', severity: model.developmentError > 3 ? 'error' : 'warning',
+      id: 'development', severity: 'error',
       title: 'Facets will not lie flat without stretch',
-      detail: `Developing this wall as one blank leaves ${model.developmentError.toFixed(1)} mm of edge mismatch. ${culprit}`,
+      detail: `Developing this wall as one blank leaves ${model.developmentError.toFixed(1)} mm of edge mismatch, and the stock does not stretch — so the blank is the wrong size for the pot, and so is every figure measured off it. ${culprit} ${cost}`,
     });
   }
 
@@ -2080,7 +2389,40 @@ export function getPlanterChecks(model: PlanterModel, material: MaterialSpec): F
     });
   }
 
-  if (construction === 'banded' && jointTab > 0.5 && jointTab < material.thickness * 4) {
+  // A groove shuts on itself after turning through its own included angle, so a
+  // bit that is not the fold angle is a fold with no stop in it. Worth being
+  // plain about which way round the failure goes, because they are different
+  // jobs to fix: too wide leaves the corner soft, too narrow will not reach.
+  const missed = bitMismatch(model);
+  if (missed.length > 0) {
+    const worst = missed[0];
+    const open = worst.bit > worst.bend;
+    checks.push({
+      id: 'v-bit',
+      severity: open ? 'warning' : 'error',
+      title: open ? `A ${worst.bit}° bit will not close these folds` : `A ${worst.bit}° bit cannot reach these folds`,
+      detail: open
+        ? `${missed.length === 1 ? 'One crease turns' : `${missed.length} creases turn`} less than the bit is ground to — the steepest gap is a fold of ${worst.bend.toFixed(0)}° in a ${worst.bit}° groove, which bottoms out with ${(worst.bit - worst.bend).toFixed(0)}° still to go. Nothing stops the corner there, so it springs back and the seam has to hold it. Fit a ${Math.max(5, Math.round(worst.bend / 5) * 5)}° bit, or set the bit to Auto and let every crease carry its own angle on the drawing.`
+        : `${missed.length === 1 ? 'One crease turns' : `${missed.length} creases turn`} further than the bit can open — a fold of ${worst.bend.toFixed(0)}° cannot be made with a ${worst.bit}° groove, because the groove runs out of angle ${(worst.bend - worst.bit).toFixed(0)}° short and the two faces meet before the panel is round. Fit a ${Math.max(5, Math.round(worst.bend / 5) * 5)}° bit, or set the bit to Auto.`,
+    });
+  }
+
+  // A groove is a real width on a real facet. Take too much of one and there is
+  // no flat face left between the creases — the panel stops reading as facets
+  // and starts reading as a crushed tube.
+  if (!model.groove.heatBent && model.groove.width > 0) {
+    // Across the facet, so twice the radius: the groove has to fit between one
+    // crease and the one facing it, not between a crease and the middle.
+    const facet = facetInradius(model.triangles, model.vertices, sides + 1) * 2;
+    if (Number.isFinite(facet) && facet > 0 && model.groove.width > facet * 0.25) {
+      checks.push({
+        id: 'groove-width', severity: 'warning', title: 'The groove is wide for these facets',
+        detail: `A ${model.groove.width.toFixed(1)} mm groove takes ${((model.groove.width / facet) * 100).toFixed(0)}% of a ${facet.toFixed(0)} mm facet, ${model.groove.depth.toFixed(1)} mm deep on ${material.thickness} mm ${material.shortName}. Little flat face is left between one crease and the next. Fewer bands or fewer sides, a narrower bit, or thinner stock.`,
+      });
+    }
+  }
+
+  if (model.joints > 0 && jointTab > 0.5 && jointTab < material.thickness * 4) {
     checks.push({
       id: 'joint-tab', severity: 'warning', title: 'Rivet tabs are short for this stock',
       detail: `A ${Math.round(jointTab)} mm tab on ${material.thickness} mm stock leaves little room to land a rivet clear of the fold. Give the joint tabs at least ${Math.ceil(material.thickness * 4)} mm.`,
@@ -2386,9 +2728,9 @@ export function getPlanterChecks(model: PlanterModel, material: MaterialSpec): F
   }
 
   if (checks.length === 0) {
-    const how = construction === 'banded'
-      ? `${rows} riveted ${rows === 1 ? 'band' : 'bands'}`
-      : `${rows} ${rows === 1 ? 'band' : 'bands'} from one blank`;
+    const how = model.joints === 0
+      ? `${rows} ${rows === 1 ? 'band' : 'bands'} from one blank`
+      : `${rows} ${rows === 1 ? 'band' : 'bands'} in ${model.parts.length} riveted parts`;
     const lit = [
       cutOuts > 0 ? `${cutOuts} ${perforation === 'foldout' ? 'folded petals' : 'cut-outs'}` : '',
       model.liner ? `a ${Math.round(model.liner.height)} mm liner on a ${Math.round(cavity)} mm cavity` : '',
@@ -2412,17 +2754,36 @@ export const FOLD_COLORS: Record<FoldKind, string> = {
 };
 
 /** A piece's geometry moved out of its local frame and into the nested sheet. */
-export function placedGeometry(piece: PlanterPiece) {
+export function placedGeometry(piece: PlanterPiece, mirrorAbout?: number) {
+  // Reflected about the nest's own right-hand edge rather than about zero, so
+  // the drawing lands in exactly the box it came from: same stock, same corner,
+  // same nest that already fitted — only handed the other way.
+  const at = mirrorAbout === undefined
+    ? (x: number, y: number) => ({ x, y })
+    : (x: number, y: number) => ({ x: mirrorAbout - x, y });
   return {
-    flaps: piece.flaps.map((flap) => flap.map((point) => ({ x: point.x + piece.x, y: point.y + piece.y }))),
-    outline: piece.outline.map((point) => ({ x: point.x + piece.x, y: point.y + piece.y })),
-    folds: piece.folds.map((fold) => ({
-      ...fold,
-      x1: fold.x1 + piece.x, y1: fold.y1 + piece.y, x2: fold.x2 + piece.x, y2: fold.y2 + piece.y,
-    })),
-    holes: piece.holes.map((hole) => hole.map((point) => ({ x: point.x + piece.x, y: point.y + piece.y }))),
+    flaps: piece.flaps.map((flap) => flap.map((point) => at(point.x + piece.x, point.y + piece.y))),
+    outline: piece.outline.map((point) => at(point.x + piece.x, point.y + piece.y)),
+    folds: piece.folds.map((fold) => {
+      const a = at(fold.x1 + piece.x, fold.y1 + piece.y);
+      const b = at(fold.x2 + piece.x, fold.y2 + piece.y);
+      return { ...fold, x1: a.x, y1: a.y, x2: b.x, y2: b.y };
+    }),
+    holes: piece.holes.map((hole) => hole.map((point) => at(point.x + piece.x, point.y + piece.y))),
   };
 }
+
+/**
+ * The x a drawing for `face` is reflected in, or undefined when it is not
+ * reflected at all.
+ *
+ * A mountain stays a mountain and a valley stays a valley through this: which
+ * way a crease folds is a fact about the pot, not about which side of the board
+ * you are standing on. What the reflection changes is only handedness — and
+ * which face each groove is cut from, which the layer names already carry.
+ */
+const faceAxis = (model: PlanterModel, face: PlanterFace): number | undefined =>
+  (face === 'groove' ? model.sheet.width : undefined);
 
 const FOLD_KINDS: FoldKind[] = ['mountain', 'valley', 'cut'];
 
@@ -2558,19 +2919,34 @@ function printNotes(model: PlanterModel): string[] {
   }
   notes.push('Key the panel before the first pass — the lacquer on a composite skin is what the ink has to hold onto, and unkeyed it lifts at the folds first');
   notes.push('Register to the milled outline, not to the bed: the part is already cut when it arrives');
+  // Said out loud because the cut file next to this one IS mirrored, and the two
+  // arrive at the shop together. The ink goes on the face that shows, so this one
+  // is the outside view and stays that way: print it mirrored and every facet is
+  // in the wrong place as well as the wrong way round.
+  notes.push('NOT mirrored — this is the outside face, the one the ink goes on. The cut file is mirrored for the groove face; do not match this to it');
   return notes;
 }
 
-/** 1:1 millimetre SVG of the whole nested sheet, notation and shop notes included. */
-export function buildPlanterSvg(model: PlanterModel, material: MaterialSpec, styleName: string): string {
+/**
+ * 1:1 millimetre SVG of the whole nested sheet, notation and shop notes included.
+ *
+ * Laid out for the groove face by default, because that is the face the board
+ * presents to the cutter — see `PlanterFace`. Ask for `outside` to read the net
+ * the way the finished pot reads.
+ */
+export function buildPlanterSvg(
+  model: PlanterModel, styleName: string, face: PlanterFace = 'groove',
+): string {
+  const material = model.material;
   const { width, height } = model.sheet;
+  const axis = faceAxis(model, face);
   const body: string[] = [];
   const annotation: string[] = [];
 
   for (const piece of model.pieces) {
     // Joined piece by piece: two parts that happen to touch in the nest are still
     // two parts, and running their outlines together would cut them as one.
-    const { outline, folds, holes, flaps } = placedGeometry(piece);
+    const { outline, folds, holes, flaps } = placedGeometry(piece, axis);
     body.push(svgRun(simplifyPolyline({ points: outline, closed: true }), 'cut'));
     for (const hole of holes) {
       body.push(svgRun(simplifyPolyline({ points: hole, closed: true }), 'cut'));
@@ -2586,7 +2962,13 @@ export function buildPlanterSvg(model: PlanterModel, material: MaterialSpec, sty
       for (const run of runs) body.push(svgRun(run, kind));
     }
     // Labels live in a y-up group, so each is flipped back the right way round.
-    annotation.push(`<text x="${(piece.x + 6).toFixed(2)}" y="${(-(piece.y + 12)).toFixed(2)}" font-size="14" fill="#9aa2b4" transform="scale(1,-1)">${piece.label}</text>`);
+    //
+    // A label's POSITION reflects with its part, but its glyphs must not — a
+    // mirrored word is unreadable, and the operator reading it is the whole
+    // reason it is on the drawing. So the anchor moves to the part's reflected
+    // left-hand edge and the text itself is left alone.
+    const labelX = axis === undefined ? piece.x + 6 : axis - piece.x - piece.width + 6;
+    annotation.push(`<text x="${labelX.toFixed(2)}" y="${(-(piece.y + 12)).toFixed(2)}" font-size="14" fill="#9aa2b4" transform="scale(1,-1)">${piece.label}</text>`);
   }
 
   const notes = [
@@ -2596,11 +2978,19 @@ export function buildPlanterSvg(model: PlanterModel, material: MaterialSpec, sty
       ? `Nest spans ${model.sheets} stock sheets of ${model.parameters.sheetWidth} × ${model.parameters.sheetHeight} mm`
       : `Fits one ${model.parameters.sheetWidth} × ${model.parameters.sheetHeight} mm stock sheet`,
     model.joints > 0
-      ? `Banded build: ${model.joints} riveted ring ${model.joints === 1 ? 'joint' : 'joints'}, tabs fold inward`
-      : 'Single-sheet build: every ring is a crease, not a joint',
+      ? `${model.parts.length} wall parts: ${model.joints} riveted ring ${model.joints === 1 ? 'joint' : 'joints'}, tabs fold inward. Every other ring is a crease — groove it, do not cut it`
+      : 'One wall blank: every ring is a crease, not a joint',
+    face === 'groove'
+      ? 'MIRRORED — drawn for the groove face. Board on the bed decorative side DOWN; this is what the cutter sees'
+      : 'NOT mirrored — drawn for the outside of the pot. Mirror it before cutting, or every part comes off the table handed the wrong way',
     material.foldMethod === 'heat-bend'
       ? `Heat-bend over a ${material.minRadius} mm radius — do not V-groove`
-      : 'V-groove on the reverse face; the net is drawn as seen from outside',
+      : `V-groove ${model.groove.depth.toFixed(1)} mm deep through the back skin, leaving ${model.groove.skin.toFixed(1)} mm — that skin is the hinge and cutting it makes two parts, not a fold`,
+    ...(model.groove.heatBent ? [] : [
+      model.parameters.vBitAngle > 0
+        ? `One ${model.parameters.vBitAngle}° bit for the job: ${model.groove.width.toFixed(1)} mm wide at the back face. A groove shuts after turning through its own angle, so this bit makes a ${model.parameters.vBitAngle}° fold and nothing else`
+        : `Bit per crease — the layer name is the angle. ${grooveLayerSummary(model)}. A groove shuts after turning through its own included angle, so the bit IS the fold`,
+    ]),
     `Steepest crease ${model.maxBend.toFixed(0)}° · development error ${model.developmentError.toFixed(2)} mm`,
     'Solid = mountain · dashed = valley · dash-dot = cut',
     ...lightingNotes(model),
@@ -2745,6 +3135,89 @@ const DXF_LAYERS: Record<FoldKind, { name: string; color: number }> = {
   cut: { name: 'CUT', color: 7 }, mountain: { name: 'MOUNTAIN', color: 1 }, valley: { name: 'VALLEY', color: 5 },
 };
 
+/**
+ * Steps a V-bit is ground to.
+ *
+ * The fold angles on a faceted pot are continuous — 33.9 here, 39.2 there — and
+ * a layer per distinct one would put thirty layers on a drawing with forty lines
+ * on it. 5 degrees is finer than the springback of the fold itself, so snapping
+ * to it costs nothing real and leaves a drawing an operator can sort by tool.
+ */
+const BIT_STEP = 5;
+
+/**
+ * The bits on offer, 0 being the auto bit.
+ *
+ * 90 and 120 are what a sign shop already owns, because a 90 makes a square box
+ * and a 120 makes the obtuse corner most cladding wants. They are here for that
+ * reason and not because this product needs them: a faceted pot folds far less
+ * than either at most of its creases, and picking one of these is how the studio
+ * gets to say so rather than letting the shop find out at the bench.
+ */
+export const V_BITS = [0, 45, 60, 90, 120, 135];
+
+/**
+ * The bit one crease needs.
+ *
+ * A groove of included angle a shuts on itself after turning through exactly a,
+ * so the bit IS the fold angle — not a setting beside it. With a bit fitted for
+ * the job every line gets that one; on the auto bit each line gets its own, and
+ * the drawing has to carry the angle or the operator cannot act on it.
+ */
+export function creaseBit(model: PlanterModel, fold: FoldLine): number {
+  if (fold.kind === 'cut' || model.groove.heatBent) return 0;
+  if (model.parameters.vBitAngle > 0) return model.parameters.vBitAngle;
+  const bend = fold.bend ?? model.maxBend;
+  return Math.max(BIT_STEP, Math.round(bend / BIT_STEP) * BIT_STEP);
+}
+
+/**
+ * Which bits the drawing asks for and how much of the job each one does.
+ *
+ * Written into the shop notes because the first thing anybody does with a
+ * multi-tool drawing is work out how many setups it costs them.
+ */
+export function grooveLayerSummary(model: PlanterModel): string {
+  const run = new Map<number, number>();
+  for (const piece of model.pieces) {
+    for (const fold of piece.folds) {
+      const bit = creaseBit(model, fold);
+      if (bit <= 0) continue;
+      run.set(bit, (run.get(bit) ?? 0) + Math.hypot(fold.x2 - fold.x1, fold.y2 - fold.y1));
+    }
+  }
+  if (run.size === 0) return 'no grooves';
+  return [...run].sort((a, b) => a[0] - b[0])
+    .map(([bit, mm]) => `${bit}° (${(mm / 1000).toFixed(2)} m)`).join(', ');
+}
+
+/**
+ * Every crease the fitted bit cannot close, worst first.
+ *
+ * Fit a 90 degree bit to a fold that turns 39 and the groove bottoms out with 51
+ * degrees still to go: there is no mechanical stop, the corner is held only by
+ * whatever the rivets and the skin can do, and it springs. Fit one wider than
+ * the fold and the bit cannot reach the angle at all. Both are silent on a
+ * drawing that names no angle, which is why this exists.
+ */
+export function bitMismatch(model: PlanterModel, tolerance = 2): { bend: number; bit: number }[] {
+  const bit = model.parameters.vBitAngle;
+  if (bit <= 0 || model.groove.heatBent) return [];
+  const seen = new Set<number>();
+  const out: { bend: number; bit: number }[] = [];
+  for (const piece of model.pieces) {
+    for (const fold of piece.folds) {
+      const bend = fold.bend;
+      if (fold.kind === 'cut' || bend === undefined || bend <= FLAT_CREASE) continue;
+      const key = Math.round(bend * 10);
+      if (seen.has(key) || Math.abs(bend - bit) <= tolerance) continue;
+      seen.add(key);
+      out.push({ bend, bit });
+    }
+  }
+  return out.sort((a, b) => Math.abs(b.bend - b.bit) - Math.abs(a.bend - a.bit));
+}
+
 const pair = (code: number, value: string | number): string => `${code}\n${value}\n`;
 
 /**
@@ -2754,13 +3227,20 @@ const pair = (code: number, value: string | number): string => `${code}\n${value
  * entity as its own move, so a crease written segment by segment is cut as a row
  * of stabs. R12's POLYLINE/VERTEX/SEQEND is bulkier than a later LWPOLYLINE but
  * is what the old controls read, which is the reason to be writing R12 at all.
+ *
+ * Laid out for the groove face by default — see `PlanterFace`. Geometry only,
+ * with no note in it saying which way round it is, so the face belongs in the
+ * file name: it is the one thing a DXF cannot tell the person who opens it.
  */
-export function buildPlanterDxf(model: PlanterModel): string {
-  let out = pair(0, 'SECTION') + pair(2, 'TABLES') + pair(0, 'TABLE') + pair(2, 'LAYER') + pair(70, 3);
-  for (const layer of Object.values(DXF_LAYERS)) {
-    out += pair(0, 'LAYER') + pair(2, layer.name) + pair(70, 0) + pair(62, layer.color) + pair(6, 'CONTINUOUS');
-  }
-  out += pair(0, 'ENDTAB') + pair(0, 'ENDSEC') + pair(0, 'SECTION') + pair(2, 'ENTITIES');
+export function buildPlanterDxf(model: PlanterModel, face: PlanterFace = 'groove'): string {
+  const axis = faceAxis(model, face);
+  // With one bit fitted, every groove goes to the same tool and the layer names
+  // stay what every shop already has set up. On the auto bit the lines genuinely
+  // need different tools, so each carries the angle it wants: MOUNTAIN-35 is a
+  // 35 degree groove, and the operator can sort the job by tool without opening
+  // a second document to find out which line is which.
+  const perBit = model.parameters.vBitAngle === 0 && !model.groove.heatBent;
+  const used = new Map<string, number>([[DXF_LAYERS.cut.name, DXF_LAYERS.cut.color]]);
 
   // 66 marks the vertices as following; bit 1 of 70 is what makes the run closed,
   // so a closed contour needs no joining up after it lands on the shop machine.
@@ -2774,23 +3254,46 @@ export function buildPlanterDxf(model: PlanterModel): string {
     return entity + pair(0, 'SEQEND') + pair(8, layer);
   };
 
+  let body = '';
   for (const piece of model.pieces) {
     // Joined piece by piece: two parts that happen to touch in the nest are still
     // two parts, and running their outlines together would cut them as one.
-    const { outline, folds, holes, flaps } = placedGeometry(piece);
-    out += polyline(DXF_LAYERS.cut.name, simplifyPolyline({ points: outline, closed: true }));
+    const { outline, folds, holes, flaps } = placedGeometry(piece, axis);
+    body += polyline(DXF_LAYERS.cut.name, simplifyPolyline({ points: outline, closed: true }));
     for (const hole of holes) {
-      out += polyline(DXF_LAYERS.cut.name, simplifyPolyline({ points: hole, closed: true }));
+      body += polyline(DXF_LAYERS.cut.name, simplifyPolyline({ points: hole, closed: true }));
     }
     // Open, and flagged open: a petal stays attached along its hinge.
     for (const flap of flaps) {
-      out += polyline(DXF_LAYERS.cut.name, simplifyPolyline({ points: flapSlit(flap as Triangle2, model.parameters.perfTool), closed: false }));
+      body += polyline(DXF_LAYERS.cut.name, simplifyPolyline({ points: flapSlit(flap as Triangle2, model.parameters.perfTool), closed: false }));
     }
     for (const kind of FOLD_KINDS) {
-      const runs = chainFoldLines(folds.filter((fold) => fold.kind === kind));
-      for (const run of runs) out += polyline(DXF_LAYERS[kind].name, run);
+      const mine = folds.filter((fold) => fold.kind === kind);
+      if (mine.length === 0) continue;
+      // Grouped by tool before they are joined up. Two creases that meet end to
+      // end but want different bits are two runs, not one: chained together they
+      // would be grooved in a single pass at whichever angle was read first.
+      const byBit = new Map<number, FoldLine[]>();
+      for (const fold of mine) {
+        const bit = perBit ? creaseBit(model, fold) : 0;
+        byBit.set(bit, [...(byBit.get(bit) ?? []), fold]);
+      }
+      for (const [bit, lines] of [...byBit].sort((a, b) => a[0] - b[0])) {
+        const name = bit > 0 ? `${DXF_LAYERS[kind].name}-${bit}` : DXF_LAYERS[kind].name;
+        used.set(name, DXF_LAYERS[kind].color);
+        for (const run of chainFoldLines(lines)) body += polyline(name, run);
+      }
     }
   }
+
+  // The table is written last because only now is it known which layers the
+  // drawing actually uses: a declared layer with nothing on it is a tool an
+  // operator sets up for no reason.
+  let out = pair(0, 'SECTION') + pair(2, 'TABLES') + pair(0, 'TABLE') + pair(2, 'LAYER') + pair(70, used.size);
+  for (const [name, color] of used) {
+    out += pair(0, 'LAYER') + pair(2, name) + pair(70, 0) + pair(62, color) + pair(6, 'CONTINUOUS');
+  }
+  out += pair(0, 'ENDTAB') + pair(0, 'ENDSEC') + pair(0, 'SECTION') + pair(2, 'ENTITIES') + body;
   return `${out}${pair(0, 'ENDSEC')}${pair(0, 'EOF')}`;
 }
 

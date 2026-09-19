@@ -99,6 +99,16 @@ export interface FoldLine {
   x2: number;
   y2: number;
   kind: FoldKind;
+  /**
+   * How far the crease turns, in degrees — 0 is flat, 90 is a square corner.
+   *
+   * This is what decides which V-bit the line needs, because a groove of
+   * included angle a shuts on itself after turning exactly a. Optional because
+   * the panel patterns fold on a grid and state one bend for the whole sheet;
+   * a planter bends a different amount at every crease, so there it is always
+   * set.
+   */
+  bend?: number;
 }
 
 export type CheckSeverity = 'error' | 'warning' | 'info';
@@ -165,12 +175,54 @@ export type PlanterCategory = 'box' | 'faceted' | 'banded' | 'column' | 'lit';
 export type PlanterFootprint = 'polygon' | 'rectangle';
 
 /**
- * How the wall is made. `single-sheet` folds the whole tube from one blank, which
- * only works for surfaces that have a flat net. `banded` cuts one strip per band
- * and rivets them together, which works for any profile — a bulge included —
- * because a single strip always develops exactly.
+ * How the wall is made.
+ *
+ * `single-sheet` folds the whole tube from one blank, which only works for
+ * surfaces that have a flat net. `banded` cuts one strip per band and rivets them
+ * together, which works for any profile — a bulge included — because a single
+ * strip always develops exactly.
+ *
+ * `split` is those two measured against each other: it cuts only at the ring
+ * joints that actually carry curvature and leaves every other ring a crease. On a
+ * wall that develops it comes out as one blank, identical to `single-sheet`; on a
+ * wall that does not it is the fewest parts that fold without stretching
+ * anything, which is usually fewer than `banded` asks for and never more.
  */
-export type PlanterConstruction = 'single-sheet' | 'banded';
+export type PlanterConstruction = 'single-sheet' | 'split' | 'banded';
+
+/**
+ * Which face of the sheet a drawing is laid out for.
+ *
+ * `outside` is the face the finished pot shows — the net exactly as the model
+ * describes it, read looking at the pot from outside. `groove` is the same net
+ * reflected, for the face the machine actually works.
+ *
+ * They are mirror images, and on a composite panel the difference is not
+ * recoverable once the part is cut. The V-groove goes through the back skin and
+ * leaves the front skin as the hinge, so the board lies on the bed decorative
+ * face DOWN and the cutter sees the back. Hand it the outside view and every
+ * part comes off the table handed the wrong way round: a twist winds the wrong
+ * way, a staggered ring steps the wrong way, the seam tab lands on the wrong
+ * edge, and the face that was meant to be seen ends up inside the pot.
+ *
+ * On a pot with no handedness — no twist, no stagger, no print — the two files
+ * cut the same part, which is exactly why the mistake survives so long before
+ * anybody notices it.
+ */
+export type PlanterFace = 'outside' | 'groove';
+
+/**
+ * A run of bands cut as one blank, inclusive at both ends, so a part covering
+ * bands `from`..`to` spans rings `from` up to `to + 1`.
+ *
+ * Between two parts is a rivet line; inside one, every ring is a crease. That
+ * distinction is the drawing: creases are grooved and hold the part together, and
+ * the only lines the cutter parts are the part outlines themselves.
+ */
+export interface PlanterWallPart {
+  from: number;
+  to: number;
+}
 
 /**
  * What is milled through the wall for the light to come out of. `none` leaves
@@ -218,6 +270,25 @@ export interface PlanterParameters {
   style: PlanterStyleId;
   footprint: PlanterFootprint;
   construction: PlanterConstruction;
+  /**
+   * What it is cut from.
+   *
+   * A design input, not a preview setting: the stock has a thickness, and a
+   * thickness moves the inside face of every wall — which moves what the pot
+   * holds, where the base plate lands, and how much room is left in the cavity.
+   * It lives here so there is one answer to "which material" rather than one in
+   * the model and a second one carried beside it.
+   */
+  material: MaterialId;
+  /**
+   * Included angle of the V-bit the creases are grooved with (degrees).
+   *
+   * 0 grooves every crease with the bit it actually needs, which is its own
+   * bend angle — the drawing then carries that angle line by line. Any other
+   * value is one bit fitted for the whole job, and the checks say which creases
+   * it cannot close.
+   */
+  vBitAngle: number;
   /** Facets around the pot. 6 is the commercial staple; a rectangle is always 4. */
   sides: number;
   /** Rectangle footprint only — the mouth, across the flats (mm). */
@@ -691,19 +762,85 @@ export interface PlanterPerfCells {
   flaps: Vec2[][];
 }
 
+/**
+ * The wall as a solid, not as a surface.
+ *
+ * `PlanterModel.vertices` is the OUTSIDE of the pot. That is not a convention
+ * picked for convenience — it is forced by how the thing is made. The V-groove
+ * is cut through the back skin and the panel folds onto the front skin, so the
+ * front skin is the hinge and it is the only face whose length survives every
+ * fold unchanged. A blank developed on any other face would be the wrong size
+ * the moment it was bent.
+ *
+ * Everything here is the other face: the same grid pushed in by one thickness,
+ * mitred so that the offset facets still meet at a shared corner instead of
+ * opening a gap at every crease. It is what the pot actually holds, what the
+ * liner actually has to clear, and what the base plate actually has to drop past.
+ */
+export interface PlanterSolid {
+  /** Inner-face twin of `PlanterModel.vertices`, indexed the same [ring][column]. */
+  inner: Vec3[][];
+  /** The thickness the inside was pushed in by (mm). */
+  thickness: number;
+  /** What it holds to the brim, measured on the inside face and off the floor (L). */
+  litres: number;
+  /** What a zero-thickness shell would have claimed it holds (L) — always the larger. */
+  surfaceLitres: number;
+  /** Smallest inside width across the mouth (mm) — what a root ball has to pass. */
+  innerOpening: number;
+  /** Real gap left between the inside face and the liner (mm). Null without one. */
+  cavity: number | null;
+}
+
+/**
+ * The V-groove itself: one cut, repeated at every crease on the wall.
+ *
+ * Depth and width are the same everywhere because they come from the stock and
+ * the bit, not from the design. What changes crease by crease is the angle the
+ * fold needs, and that rides on each `FoldLine` instead.
+ */
+export interface PlanterGroove {
+  /** Cut from the grooved (inside) face down towards the hinge (mm). */
+  depth: number;
+  /** How wide the cut is where it breaks the inside face (mm). */
+  width: number;
+  /** Stock left under the cut — this is the hinge, and it must not be cut through (mm). */
+  skin: number;
+  /** Bit fitted for the job (degrees), or 0 when each crease gets the bit it needs. */
+  bit: number;
+  /** Outside corner radius the fold closes to (mm) — a V-groove is never truly sharp. */
+  radius: number;
+  /** True when the stock cannot be grooved at all and every crease is heat-bent. */
+  heatBent: boolean;
+}
+
 export interface PlanterModel {
   parameters: PlanterParameters;
+  /** The stock it is cut from, resolved once so nothing downstream has to guess. */
+  material: MaterialSpec;
+  /** The wall given its thickness — the inside face, and what follows from it. */
+  solid: PlanterSolid;
+  /** What the V-bit does at every crease. */
+  groove: PlanterGroove;
   /** Wall vertices in mm, z up, indexed [ring][column]; column N repeats column 0 at the seam. */
   vertices: Vec3[][];
   /**
    * The same wall developed flat, in sheet coordinates, split band by band:
    * `flatByBand[band][0]` is the ring below it and `[1]` the ring above. Bands are
-   * kept apart rather than merged into one grid because banded construction puts
-   * each one on its own piece — in single-sheet construction they simply meet.
+   * kept apart rather than merged into one grid because a wall cut into parts puts
+   * them on different pieces — within one part they simply meet.
    */
   flatByBand: Vec2[][][];
   triangles: { v: [number, number, number]; normal: Vec3 }[];
   pieces: PlanterPiece[];
+  /**
+   * Which bands each wall blank carries, low to high. One entry is a wall folded
+   * from a single sheet; every extra entry is another riveted ring joint, and the
+   * ring between two entries is the only place the wall is cut rather than
+   * grooved. `pieces` lists these first, in this order, so `parts[i]` is drawn by
+   * `pieces[i]`.
+   */
+  parts: PlanterWallPart[];
   /** Union bounding box of the nested layout (mm). */
   sheet: { width: number; height: number };
   /** Steepest crease on the wall (degrees) — what the V-bit and the skin must survive. */

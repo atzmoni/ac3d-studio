@@ -13,11 +13,13 @@ import { useStoneMaterial, type StoneLook } from '@/components/planter-stone-mat
 import { CameraRig, StudioLights } from '@/components/three-stage';
 import { buildFoldTree, cornersAt, internalEdges, type FoldTree } from '@/lib/fold-tree';
 import { getMaterial, MATERIALS } from '@/lib/pattern-engine';
+import { solidSkin } from '@/lib/planter-solid';
 import { draftMarks } from '@/lib/planter-drafting';
 import {
   buildPlanterDxf, buildPlanterModel, buildPlanterPrintSvg, buildPlanterSvg, collarColour,
   DEFAULT_PLANTER, FOLD_COLORS, getPlanterChecks, getPlanterStats, isLitPlanter, LED_CONTROLLERS,
-  LED_DENSITIES, ledGlow, LED_POSITIONS, LEDS, litPlanter, placedGeometry, unlitPlanter,
+  grooveLayerSummary, LED_DENSITIES, ledGlow, LED_POSITIONS, LEDS, litPlanter, placedGeometry, planterSplit,
+  unlitPlanter, V_BITS,
 } from '@/lib/planter-engine';
 import { getLedEffect, hexToHsl, ledThrow, LED_BASE_COLOURS, LED_EFFECTS, pixelColor } from '@/lib/planter-led-effects';
 import { barycentric, flapSlit, type Triangle2 } from '@/lib/planter-perforation';
@@ -35,7 +37,7 @@ import {
 } from '@/lib/planter-finishes';
 import { BLANK_PLANTER, getPlanterStyle, PLANTER_CATEGORIES, PLANTER_PRESETS, PLANTER_STYLES } from '@/lib/planter-styles';
 import type {
-  FoldKind, MaterialId, PlanterCategory, PlanterConstruction, PlanterFootprint, PlanterLed,
+  FoldKind, MaterialId, PlanterCategory, PlanterConstruction, PlanterFace, PlanterFootprint, PlanterLed,
   PlanterLedController, PlanterLedPosition, PlanterModel, PlanterParameters, PlanterPerforation,
   PlanterPiece, PlanterPrint, PlanterPrintFit, PlanterPrintRule, PlanterStyleId, Vec2, Vec3,
 } from '@/lib/types';
@@ -106,6 +108,12 @@ const PERF_SIZES: PatternOption[] = [
 interface ShellPiece {
   tree: FoldTree;
   crease: { tri: number; corners: [number, number] }[];
+  /**
+   * Each triangle's three vertex ids. The solid builder reads them to tell a
+   * crease from a cut edge: an edge with a neighbour is grooved and keeps its
+   * skin, and an edge without one shows the thickness of the stock.
+   */
+  ids: [number, number, number][];
   /** Where this piece's triangles start in the model's own triangle list. */
   from: number;
   /**
@@ -133,28 +141,51 @@ interface ShellPiece {
 const toWorld = (p: THREE.Vector3) => new THREE.Vector3(p.x, p.z, p.y);
 
 /**
+ * What the automatic split costs this design, in the terms somebody ordering it
+ * cares about: how many blanks come off the sheet and how many rivet lines go
+ * between them. Reads the wall as it is actually being built, so it says "one
+ * blank" for a shape that never needed cutting rather than promising a split it
+ * is not going to make.
+ */
+const splitNote = (model: PlanterModel): string => {
+  const parts = model.parts.length;
+  if (parts === 1) return 'This pot develops whole, so it still comes off as one blank with no rivet line at all.';
+  const bands = model.parts
+    .map((part) => (part.from === part.to ? `${part.from + 1}` : `${part.from + 1}–${part.to + 1}`))
+    .join(' · ');
+  return `${parts} parts (bands ${bands}), ${parts - 1} rivet ${parts === 2 ? 'line' : 'lines'}.`;
+};
+
+/**
  * The pot folds up out of its own flat net as a chain of hinge rotations, one
- * chain per physical piece — the whole wall in single-sheet construction,
- * since it really is cut from one blank, or one chain per riveted band in
- * banded construction, since those are genuinely separate strips. A hinge
- * chain keeps every facet perfectly rigid and keeps it attached to its
- * neighbour throughout, which a straight-line vertex move cannot: that always
- * stretches material on the way, and for a piece nested apart from its
- * neighbours on the cutting sheet it makes the pot look like it assembles out
- * of scattered debris rather than folding shut.
+ * chain per physical part: the whole wall when it is cut from one blank, or one
+ * chain per riveted part when it is not, because those are genuinely separate
+ * pieces of metal. A hinge chain keeps every facet perfectly rigid and keeps it
+ * attached to its neighbour throughout, which a straight-line vertex move
+ * cannot: that always stretches material on the way, and for a piece nested
+ * apart from its neighbours on the cutting sheet it makes the pot look like it
+ * assembles out of scattered debris rather than folding shut.
+ *
+ * One chain per part is also what makes the preview readable as a drawing. A
+ * chain can only come apart at its own edges, so the lines that open on screen
+ * are exactly the lines the cutter parts, and every crease inside a chain stays
+ * shut — which is what a grooved line does. Ask one chain to span a wall that
+ * does not develop and it cannot honour that: the hinges stop being isometries,
+ * facets drift apart mid-fold, and the preview shows the wall splitting along
+ * rings the file only ever asked to be scored.
  */
 function usePlanterShell(model: PlanterModel) {
   return useMemo(() => {
-    const { sides, rows, height, construction } = model.parameters;
+    const { sides, rows, height } = model.parameters;
     const stride = sides + 1;
-    const banded = construction === 'banded';
+    const inParts = model.parts.length > 1;
     const span = Math.max(
       height,
       ...model.vertices.map((ring) => Math.hypot(ring[0].x, ring[0].y) * 2),
-      // A single-sheet net can be much wider than the pot itself, so the camera
-      // has to size for it. A banded net no longer positions itself on the sheet
+      // A one-blank net can be much wider than the pot itself, so the camera has
+      // to size for it. A wall in parts no longer positions itself on the sheet
       // at all (see below), so the nest width is irrelevant to its scale.
-      banded ? 0 : model.sheet.width,
+      inParts ? 0 : model.sheet.width,
     );
     const scale = POT_FIT / span;
     const netCx = model.sheet.width / 2;
@@ -194,22 +225,31 @@ function usePlanterShell(model: PlanterModel) {
       netUv(model.flatByBand[band][Math.floor(id / stride) - band][id % stride], netBox);
 
     const pieces: ShellPiece[] = [];
-    if (banded) {
-      // Single-sheet construction folds from one connected blank, so every band
-      // shares the same flat frame the unfolded net puts it in. Banded
-      // construction cuts each band as its own separate part, which generally
-      // lands far from its neighbours on the nested cutting sheet, so each band
-      // instead starts flat directly beneath the spot it will occupy once
-      // built — only the hinge chain's own curl carries it the rest of the way.
-      for (let band = 0; band < rows; band += 1) {
-        const ids = model.triangles.slice(band * sides * 2, (band + 1) * sides * 2).map((t) => t.v);
-        const solidPts = [...model.vertices[band], ...model.vertices[band + 1]];
+    if (inParts) {
+      // A wall cut from one blank keeps every band in the flat frame the unfolded
+      // net put it in. A wall in parts does not: its parts generally land far
+      // from each other on the nested cutting sheet, so each one instead starts
+      // flat directly beneath the spot it will occupy once built — only the hinge
+      // chain's own curl carries it the rest of the way.
+      for (const part of model.parts) {
+        const first = part.from * sides * 2;
+        const count = (part.to - part.from + 1) * sides * 2;
+        const ids = model.triangles.slice(first, first + count).map((t) => t.v);
+        // A ring inside a part is shared by the bands either side of it, and the
+        // net holds it once per band. Either copy reads the same point, so the
+        // lower band's is taken and only the part's topmost ring comes from above.
+        const bandOf = (id: number) => Math.min(Math.max(Math.floor(id / stride), part.from), part.to);
+        const solidPts = model.vertices.slice(part.from, part.to + 2).flat();
         const targetX = (solidPts.reduce((sum, p) => sum + p.x, 0) / solidPts.length) * scale;
         const targetZ = -(solidPts.reduce((sum, p) => sum + p.y, 0) / solidPts.length) * scale;
-        const flatPts = [...model.flatByBand[band][0], ...model.flatByBand[band][1]];
+        const flatPts = [
+          ...model.flatByBand.slice(part.from, part.to + 1).map((band) => band[0]).flat(),
+          ...model.flatByBand[part.to][1],
+        ];
         const flatCx = flatPts.reduce((sum, p) => sum + p.x, 0) / flatPts.length;
         const flatCy = flatPts.reduce((sum, p) => sum + p.y, 0) / flatPts.length;
         const flatOf = (id: number): Vec2 => {
+          const band = bandOf(id);
           const p = model.flatByBand[band][Math.floor(id / stride) - band][id % stride];
           return { x: (p.x - flatCx) * scale + targetX, y: -(p.y - flatCy) * scale + targetZ };
         };
@@ -220,10 +260,11 @@ function usePlanterShell(model: PlanterModel) {
         const tree = buildFoldTree(triangles, ids, { x: targetX, y: targetZ });
         pieces.push({
           tree,
+          ids,
           crease: internalEdges(ids),
-          cut: cutsFor(band * sides * 2, sides * 2),
-          from: band * sides * 2,
-          uv: ids.map(([a, b, c]) => [uvOf(band, a), uvOf(band, b), uvOf(band, c)]),
+          cut: cutsFor(first, count),
+          from: first,
+          uv: ids.map((tri) => tri.map((id) => uvOf(bandOf(id), id)) as [number, number][]),
         });
       }
     } else {
@@ -246,6 +287,7 @@ function usePlanterShell(model: PlanterModel) {
       const tree = buildFoldTree(triangles, ids, pivot);
       pieces.push({
         tree,
+        ids,
         crease: internalEdges(ids),
         cut: cutsFor(0, model.triangles.length),
         from: 0,
@@ -626,6 +668,11 @@ function PlanterMesh({ model, finish, customColor, plant, assembly, autoRotate }
   // A shade darker, so the base plate and collar read as separate parts from
   // the wall rather than melting into one flat-coloured shape.
   const accentColor = useMemo(() => `#${new THREE.Color(wallColor).multiplyScalar(0.86).getHexString()}`, [wallColor]);
+  // What the stock looks like where it was cut or grooved, rather than where it
+  // was finished. A composite panel is two bright skins round a dark core and a
+  // painted one is only painted on the face that shows — so a sawn edge and the
+  // back of the sheet are the material's own colour, never the pot's.
+  const coreColor = model.material.accent;
   // What comes through the openings. The three whites are one colour each; an
   // addressable strip has no single colour at all, so the mesh carries its own
   // per-facet tint and the material only has to stop tinting it a second time.
@@ -682,7 +729,7 @@ function PlanterMesh({ model, finish, customColor, plant, assembly, autoRotate }
     };
   }, [model]));
 
-  const { wall, creases, cutouts, petals, pixelU, pixelV, tinted } = useMemo(() => {
+  const { wall, back, edges, creases, cutouts, petals, pixelU, pixelV, tinted } = useMemo(() => {
     const pos: number[] = [];
     const uvs: number[] = [];
     const paint: number[] = [];
@@ -696,6 +743,19 @@ function PlanterMesh({ model, finish, customColor, plant, assembly, autoRotate }
     const cutU: number[] = [];
     const cutY: number[] = [];
     const petalData: number[] = [];
+    // The back of the panel and the material on show at every parted edge.
+    const backData: number[] = [];
+    const rimData: number[] = [];
+    // The stock, and the cut in it, brought into the viewport's own units. The
+    // pot is drawn to fit the frame whatever size it is, so a thickness in
+    // millimetres has to travel with it or the wall would read as 4 mm thick on
+    // a 300 mm pot and paper-thin on a 900 mm one.
+    const skin = model.solid.thickness * shell.scale;
+    const cut = {
+      depth: model.groove.depth * shell.scale,
+      width: model.groove.width * shell.scale,
+      skin: model.groove.skin * shell.scale,
+    };
     // The petals only stand up once the pot does: they are bent by hand after
     // the wall is folded, so they open over the last of the fold.
     const lift = ((model.parameters.perfLift * Math.PI) / 180) * Math.max(0, Math.min(1, (t - 0.6) / 0.4));
@@ -713,6 +773,14 @@ function PlanterMesh({ model, finish, customColor, plant, assembly, autoRotate }
           for (let corner = 0; corner < 3; corner += 1) paint.push(colour.r, colour.g, colour.b);
         }
       });
+      // The same facets given their thickness: a back face one skin behind the
+      // front, a V cut into it along every crease, and a band of material at
+      // every edge the cutter parted. Rebuilt as the fold runs, so the groove
+      // is seen open on the flat blank and shut on the finished pot.
+      const solid = solidSkin(corners, piece.ids, skin, cut);
+      backData.push(...solid.inner);
+      rimData.push(...solid.rim);
+
       for (const edge of piece.crease) {
         const a = corners[edge.tri][edge.corners[0]];
         const b = corners[edge.tri][edge.corners[1]];
@@ -833,12 +901,26 @@ function PlanterMesh({ model, finish, customColor, plant, assembly, autoRotate }
     bent.setAttribute('position', new THREE.BufferAttribute(new Float32Array(petalData), 3));
     bent.computeVertexNormals();
 
-    return { wall: surface, creases: lines, cutouts: openings, petals: bent, pixelU, pixelV, tinted };
+    // Flat-shaded on purpose, both of them. The back of a composite panel is
+    // mill-finish aluminium and a cut edge is a sawn core: neither is smooth,
+    // and averaging normals across a groove wall would round off the one thing
+    // these are here to show.
+    const back = new THREE.BufferGeometry();
+    back.setAttribute('position', new THREE.BufferAttribute(new Float32Array(backData), 3));
+    back.computeVertexNormals();
+
+    const edges = new THREE.BufferGeometry();
+    edges.setAttribute('position', new THREE.BufferAttribute(new Float32Array(rimData), 3));
+    edges.computeVertexNormals();
+
+    return { wall: surface, back, edges, creases: lines, cutouts: openings, petals: bent, pixelU, pixelV, tinted };
   }, [shell, t, model.parameters.perfLift, model.parameters.led, addressable, effect, baseHsl, position, fills]);
 
   // Each geometry gets its own cleanup. Sharing one effect would dispose buffers
   // that are still mounted every time only the assembly slider moves.
   useEffect(() => () => { wall.dispose(); }, [wall]);
+  useEffect(() => () => { back.dispose(); }, [back]);
+  useEffect(() => () => { edges.dispose(); }, [edges]);
   useEffect(() => () => { creases.dispose(); }, [creases]);
   useEffect(() => () => { cutouts.dispose(); }, [cutouts]);
   useEffect(() => () => { petals.dispose(); }, [petals]);
@@ -878,6 +960,24 @@ function PlanterMesh({ model, finish, customColor, plant, assembly, autoRotate }
     <group ref={group}>
       <mesh geometry={wall} frustumCulled={false}>
         <Skin stone={stoneSkin} print={printSkin} color={wallColor} finish={finish} />
+      </mesh>
+      {/* The back of the panel, with the V-grooves cut into it, and the material
+          on show at every edge the cutter parted. Together these are the whole
+          difference between a pot and a picture of a surface: the mouth and the
+          foot stop being infinitely sharp, the seam reads as two edges meeting
+          rather than one line, and the groove is visibly open on the flat blank
+          and visibly shut once the fold has run. */}
+      <mesh geometry={back} frustumCulled={false}>
+        <meshStandardMaterial
+          color={coreColor} metalness={finish.metalness} roughness={0.78}
+          side={THREE.DoubleSide} flatShading
+        />
+      </mesh>
+      <mesh geometry={edges} frustumCulled={false}>
+        <meshStandardMaterial
+          color={coreColor} metalness={finish.metalness} roughness={0.84}
+          side={THREE.DoubleSide} flatShading
+        />
       </mesh>
       {/* The drafting layer, and an imported image — everything printed OVER
           the fills. A decal on the same facets rather than a second colour in
@@ -1013,7 +1113,9 @@ function PlanterPreview({ model, finish, customColor, plant, backdrop, assembly,
  * thumbnail drops the stock and the loose plates and shows the wall net alone —
  * at card size the creases are the only thing that tells two designs apart.
  */
-function PlanterNet({ model, thumb = false }: { model: PlanterModel; thumb?: boolean }) {
+function PlanterNet({ model, thumb = false, face = 'groove' }: {
+  model: PlanterModel; thumb?: boolean; face?: PlanterFace;
+}) {
   const { sheetWidth, sheetHeight } = model.parameters;
   // The net is turned onto the stock whichever way round it fits, so the stock
   // outline has to follow it rather than the other way about.
@@ -1053,6 +1155,10 @@ function PlanterNet({ model, thumb = false }: { model: PlanterModel; thumb?: boo
   const width = thumb ? Math.max(...stacked.map((piece) => piece.width)) : Math.max(model.sheet.width, stock.width);
   const height = thumb ? stackY - gap : Math.max(model.sheet.height, stock.height);
   const weight = (thumb ? 0.006 : 0.0016) * Math.max(width, height);
+  // The same reflection the exported file gets, in the same axis, so what is on
+  // screen is what lands on the machine — including which hand the part is.
+  const mirror = face === 'groove';
+  const axis = thumb ? width : model.sheet.width;
 
   return (
     <svg
@@ -1068,6 +1174,12 @@ function PlanterNet({ model, thumb = false }: { model: PlanterModel; thumb?: boo
             stroke="#2a2d3d" strokeWidth={weight} strokeDasharray={`${weight * 12} ${weight * 8}`}
           />
         )}
+        {/* Everything on the board, reflected together when the drawing is for
+            the groove face — including the artwork, which is on the far side
+            from there and so really does read backwards. The stock stays outside
+            this group: the sheet is what the parts are reflected inside, and a
+            frame that moved with them would be describing a different sheet. */}
+        <g transform={mirror ? `translate(${axis},0) scale(-1,1)` : undefined}>
         {/* The print, under the tool paths. The milling sheet and the print
             file are the same sheet in the same millimetres — that is the whole
             reason the artwork can be laid out on facets at all — so the one
@@ -1120,6 +1232,7 @@ function PlanterNet({ model, thumb = false }: { model: PlanterModel; thumb?: boo
             </g>
           );
         })}
+        </g>
       </g>
     </svg>
   );
@@ -1127,7 +1240,9 @@ function PlanterNet({ model, thumb = false }: { model: PlanterModel; thumb?: boo
 
 function PresetThumb({ parameters }: { parameters: PlanterParameters }) {
   const model = useMemo(() => buildPlanterModel(parameters), [parameters]);
-  return <PlanterNet model={model} thumb />;
+  // A catalogue card is a picture of the pot, not a drawing for the bed, so it
+  // is read the way the pot is read.
+  return <PlanterNet model={model} thumb face="outside" />;
 }
 
 // ---------------------------------------------------------------------------
@@ -1146,7 +1261,7 @@ export default function PlanterStudio({ onStatus }: { onStatus?: (status: Studio
     () => ({ ...DEFAULT_PLANTER, ...PLANTER_PRESETS[0].parameters }),
   );
   const [presetId, setPresetId] = useState(PLANTER_PRESETS[0].id);
-  const [materialId, setMaterialId] = useState<MaterialId>('acp-4');
+
   const [finishId, setFinishId] = useState(PLANTER_FINISHES[2].id);
   const [customColor, setCustomColor] = useState('#c0392b');
   const [backdropId, setBackdropId] = useState(PLANTER_BACKDROPS[0].id);
@@ -1154,7 +1269,14 @@ export default function PlanterStudio({ onStatus }: { onStatus?: (status: Studio
   const [stoneFamily, setStoneFamily] = useState<string>('all');
   const [search, setSearch] = useState('');
   const [category, setCategory] = useState<PlanterCategory | 'all'>('all');
-  const [view, setView] = useState<ViewAngle>('hero');
+  const [view, setView] = useState<ViewAngle>("hero");
+  /**
+   * Which face the flat drawing is read on — and exported on, because the screen
+   * has to show what the file carries or the toggle is worse than not having it.
+   * Starts on the groove face: that is the one the board presents to the cutter,
+   * and the outside view is the one that has to be asked for.
+   */
+  const [face, setFace] = useState<PlanterFace>("groove");
   /** Set when "Light me up" had to widen the collar to land the panel on it. */
   const [collarNote, setCollarNote] = useState<string | null>(null);
   /** The pattern family to come back to when the wall is switched on again. */
@@ -1175,13 +1297,16 @@ export default function PlanterStudio({ onStatus }: { onStatus?: (status: Studio
   const viewportRef = useRef<HTMLDivElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
 
-  const material = getMaterial(materialId);
   const finish = finishById(finishId);
   const backdrop = backdropById(backdropId);
   const style = getPlanterStyle(parameters.style);
   const model = useMemo(() => buildPlanterModel(parameters), [parameters]);
-  const stats = useMemo(() => getPlanterStats(model, material), [model, material]);
-  const checks = useMemo(() => getPlanterChecks(model, material), [model, material]);
+  // Read back off the model rather than kept beside it. The stock is a design
+  // parameter now, so the pot's own thickness and the one quoted in the panel
+  // are the same number by construction and cannot drift apart.
+  const material = model.material;
+  const stats = useMemo(() => getPlanterStats(model), [model]);
+  const checks = useMemo(() => getPlanterChecks(model), [model]);
   const blocking = checks.some((check) => check.severity === 'error');
   const lit = isLitPlanter(parameters);
   const coat = model.stone;
@@ -1342,12 +1467,15 @@ export default function PlanterStudio({ onStatus }: { onStatus?: (status: Studio
 
   useEffect(() => { if (reducedMotion) setPlaying(false); }, [reducedMotion]);
 
-  const readout = `${parameters.footprint === 'rectangle' ? 'Rectangle' : `${parameters.sides} sides`} · ${parameters.rows} ${parameters.rows === 1 ? 'band' : 'bands'}${parameters.construction === 'banded' ? ' · banded' : ''}`;
+  const readout = `${parameters.footprint === 'rectangle' ? 'Rectangle' : `${parameters.sides} sides`} · ${parameters.rows} ${parameters.rows === 1 ? 'band' : 'bands'}${model.parts.length > 1 ? ` · ${model.parts.length} parts` : ''}`;
   useEffect(() => {
     onStatus?.({ blocking, readout: [material.shortName, readout] });
   }, [onStatus, blocking, material.shortName, readout]);
 
   const fileStem = `dxf-ac3d-planter-${presetId}-${parameters.sides}s-${Math.round(parameters.height)}mm`;
+  // In the name, because a DXF is geometry and carries no note saying which way
+  // round it is. Two files that cut mirror-image parts must not share a name.
+  const faceStem = `${fileStem}-${face === 'groove' ? 'mirrored-groove' : 'outside'}`;
 
   return (
     <>
@@ -1414,12 +1542,15 @@ export default function PlanterStudio({ onStatus }: { onStatus?: (status: Studio
           </div>
           <div className="category-pills" role="group" aria-label="Construction">
             <button className={`pill ${parameters.construction === 'single-sheet' ? 'active' : ''}`} aria-pressed={parameters.construction === 'single-sheet'} onClick={() => update('construction', 'single-sheet' as PlanterConstruction)}>Single sheet</button>
+            <button className={`pill ${parameters.construction === 'split' ? 'active' : ''}`} aria-pressed={parameters.construction === 'split'} onClick={() => update('construction', 'split' as PlanterConstruction)}>Split (auto)</button>
             <button className={`pill ${parameters.construction === 'banded' ? 'active' : ''}`} aria-pressed={parameters.construction === 'banded'} onClick={() => update('construction', 'banded' as PlanterConstruction)}>Banded (riveted)</button>
           </div>
           <p className="footnote">
             {parameters.construction === 'banded'
-              ? 'Each band is its own strip, riveted ring to ring — the only way to build a bulged or waisted wall.'
-              : 'The whole wall folds from one blank. Fine for taper, stagger, twist and rhythm; a bulge needs banded.'}
+              ? 'Each band is its own strip, riveted ring to ring — always works, and usually a rivet line or two more than the pot needs.'
+              : parameters.construction === 'split'
+                ? `Cuts only the rings that carry the curvature; the rest stay creases. ${splitNote(model)}`
+                : 'The whole wall folds from one blank. Fine for taper, stagger, twist and rhythm; curvature needs a split.'}
           </p>
         </div>
 
@@ -1445,8 +1576,8 @@ export default function PlanterStudio({ onStatus }: { onStatus?: (status: Studio
           <SliderField label="Twist" value={parameters.twist} min={-90} max={90} step={2} suffix="°" onChange={(value) => update('twist', value)} />
           <SliderField label="Bulge" value={parameters.bulge} min={-45} max={60} step={1} suffix="%" onChange={(value) => update('bulge', value)} />
           <p className="field-hint tech-data">
-            {Math.abs(parameters.bulge) > 0.5 && parameters.construction !== 'banded'
-              ? 'A bulge is curvature — switch to banded construction to build it'
+            {model.developmentError > 0.8
+              ? `${model.developmentError.toFixed(1)} mm of stretch — Split builds this in ${planterSplit(model).length} parts`
               : `Develops flat to ${model.developmentError.toFixed(2)} mm`}
           </p>
         </div>
@@ -1454,7 +1585,7 @@ export default function PlanterStudio({ onStatus }: { onStatus?: (status: Studio
         <div className="sidebar-section">
           <div className="panel-title">Fittings <span>Assembly</span></div>
           <SliderField label="Seam tab" value={parameters.tabWidth} min={0} max={80} step={1} suffix="mm" onChange={(value) => update('tabWidth', value)} />
-          {parameters.construction === 'banded' && (
+          {model.joints > 0 && (
             <SliderField label="Joint tab" value={parameters.jointTab} min={0} max={80} step={1} suffix="mm" onChange={(value) => update('jointTab', value)} />
           )}
           <SliderField label="Collar width" value={parameters.rimWidth} min={10} max={160} step={1} suffix="mm" onChange={(value) => update('rimWidth', value)} />
@@ -1740,7 +1871,7 @@ export default function PlanterStudio({ onStatus }: { onStatus?: (status: Studio
           <div className="panel-title">Material <span>Stock</span></div>
           <div className="select-wrap">
             <label className="sr-only" htmlFor="planter-material">Material</label>
-            <select id="planter-material" value={materialId} onChange={(event) => setMaterialId(event.target.value as MaterialId)}>
+            <select id="planter-material" value={parameters.material} onChange={(event) => update("material", event.target.value as MaterialId)}>
               {MATERIALS.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
             </select>
           </div>
@@ -1750,7 +1881,45 @@ export default function PlanterStudio({ onStatus }: { onStatus?: (status: Studio
             <div><dt>Thickness</dt><dd>{material.thickness} mm</dd></div>
             <div><dt>Max. bend</dt><dd>{material.maxBendAngle}°</dd></div>
             <div><dt>Method</dt><dd>{material.foldMethod === 'v-groove' ? 'V-groove' : 'Heat bend'}</dd></div>
+            <div><dt>Holds</dt><dd>{model.solid.litres.toFixed(1)} L</dd></div>
           </dl>
+          <p className="field-hint">
+            {`Measured inside the wall and off the floor. A shell with no thickness would have promised ${model.solid.surfaceLitres.toFixed(1)} L — ${((model.solid.surfaceLitres / model.solid.litres - 1) * 100).toFixed(1)}% more than it holds.`}
+          </p>
+        </div>
+
+        <div className="sidebar-section">
+          <div className="panel-title">Groove <span>the bit and the fold</span></div>
+          {model.groove.heatBent ? (
+            <p className="field-hint">
+              {`${material.shortName} is never grooved — every crease is bent hot over a ${material.minRadius} mm former, so there is no bit to fit.`}
+            </p>
+          ) : (<>
+            <div className="category-pills" role="group" aria-label="V-bit">
+              {V_BITS.map((bit) => (
+                <button
+                  key={bit}
+                  type="button"
+                  className={`pill ${parameters.vBitAngle === bit ? 'active' : ''}`}
+                  aria-pressed={parameters.vBitAngle === bit}
+                  onClick={() => update('vBitAngle', bit)}
+                >
+                  {bit === 0 ? 'Auto' : `${bit}°`}
+                </button>
+              ))}
+            </div>
+            <dl className="spec-list tech-data">
+              <div><dt>Groove depth</dt><dd>{model.groove.depth.toFixed(1)} mm</dd></div>
+              <div><dt>Width at the back</dt><dd>{model.groove.width.toFixed(1)} mm</dd></div>
+              <div><dt>Skin left</dt><dd>{model.groove.skin.toFixed(1)} mm</dd></div>
+              <div><dt>Steepest crease</dt><dd>{model.maxBend.toFixed(0)}°</dd></div>
+            </dl>
+            <p className="field-hint">
+              {parameters.vBitAngle === 0
+                ? `A groove shuts on itself after turning through its own included angle, so the bit IS the fold rather than a setting beside it. On Auto each crease gets the angle it needs and the DXF layer name carries it: ${grooveLayerSummary(model)}.`
+                : `One ${parameters.vBitAngle}° bit for the whole job. A groove shuts after turning through its own angle, so this bit makes a ${parameters.vBitAngle}° fold and nothing else — the checks say which creases it misses.`}
+            </p>
+          </>)}
         </div>
 
         <div className="sidebar-section">
@@ -2176,10 +2345,10 @@ export default function PlanterStudio({ onStatus }: { onStatus?: (status: Studio
 
         <div className="sidebar-section">
           <div className="panel-title">Export <span>1 : 1 scale</span></div>
-          <button className="export-button" onClick={() => download(`${fileStem}.svg`, buildPlanterSvg(model, material, style.name), 'image/svg+xml')}>
+          <button className="export-button" onClick={() => download(`${faceStem}.svg`, buildPlanterSvg(model, style.name, face), 'image/svg+xml')}>
             <Download size={13} aria-hidden="true" /> Export SVG
           </button>
-          <button className="export-button export-secondary" onClick={() => download(`${fileStem}.dxf`, buildPlanterDxf(model), 'image/vnd.dxf')}>
+          <button className="export-button export-secondary" onClick={() => download(`${faceStem}.dxf`, buildPlanterDxf(model, face), 'image/vnd.dxf')}>
             <Download size={13} aria-hidden="true" /> Export DXF
           </button>
           {job && (
@@ -2187,10 +2356,30 @@ export default function PlanterStudio({ onStatus }: { onStatus?: (status: Studio
               <Printer size={13} aria-hidden="true" /> Export print artwork
             </button>
           )}
+          <div className="category-pills" role="group" aria-label="Sheet face">
+            <button
+              className={`pill ${face === 'groove' ? 'active' : ''}`} aria-pressed={face === 'groove'}
+              onClick={() => setFace('groove')}
+            >
+              Groove face (mirrored)
+            </button>
+            <button
+              className={`pill ${face === 'outside' ? 'active' : ''}`} aria-pressed={face === 'outside'}
+              onClick={() => setFace('outside')}
+            >
+              Outside face
+            </button>
+          </div>
+          <p className="footnote">
+            {face === 'groove'
+              ? 'Drawn and exported mirrored, for the groove face: the board lies on the bed decorative side down, because the V-groove cuts through the back skin and the front skin is the hinge. This is what the cutter sees.'
+              : 'Drawn and exported as the pot is seen from outside — for reading and signing off, not for the bed. Mirror it before cutting or every part comes off handed the wrong way: the twist winds the other way and the face that should show ends up inside.'}
+          </p>
           <p className="footnote">
             {model.sheets > 1
-              ? `Wall, base plate and collar nested across ${model.sheets} stock sheets. The DXF keeps CUT, MOUNTAIN and VALLEY on separate layers — groove the reverse face.`
-              : 'Wall, base plate and collar nested on one sheet. The DXF keeps CUT, MOUNTAIN and VALLEY on separate layers — groove the reverse face.'}
+              ? `Wall, base plate and collar nested across ${model.sheets} stock sheets. The DXF keeps CUT, MOUNTAIN and VALLEY on separate layers.`
+              : 'Wall, base plate and collar nested on one sheet. The DXF keeps CUT, MOUNTAIN and VALLEY on separate layers.'}
+            {' '}The print file is always the outside face — the ink goes on the side that shows — so never match it to the cut file.
           </p>
         </div>
       </aside>
@@ -2222,7 +2411,11 @@ export default function PlanterStudio({ onStatus }: { onStatus?: (status: Studio
             model={model} finish={finish} customColor={customColor} plant={plant} backdrop={backdrop}
             assembly={parameters.assembly} view={view} viewportRef={viewportRef}
           />
-          <p className="viewport-footnote">Both ends of the slider are real geometry at 1:1. The walk between them moves each corner in a straight line — it shows the assembly, not the forming.</p>
+          <p className="viewport-footnote">
+            {model.groove.heatBent
+              ? `Real geometry at 1:1, on ${model.solid.thickness} mm stock. Every facet stays rigid the whole way — this is a hinge chain, not corners walking in straight lines. This material is bent hot rather than grooved, so there is no groove to show. Cut-outs are drawn on the wall rather than bored through it.`
+              : `Real geometry at 1:1, on ${model.solid.thickness} mm stock with a ${model.groove.depth.toFixed(1)} mm groove in the back. Every facet stays rigid the whole way — this is a hinge chain, not corners walking in straight lines — and the groove is open on the flat blank and shut by the end. Cut-outs are drawn on the wall rather than bored through it.`}
+          </p>
         </section>
       </div>
 
@@ -2234,7 +2427,7 @@ export default function PlanterStudio({ onStatus }: { onStatus?: (status: Studio
               <p className="tech-data">{stats.sheetUsage} nested · stock {parameters.sheetWidth} × {parameters.sheetHeight} mm</p>
             </div>
           </div>
-          <div className="svg-viewport"><PlanterNet model={model} /></div>
+          <div className="svg-viewport"><PlanterNet model={model} face={face} /></div>
           <div className="view-legend">
             <span><svg width="22" height="7" aria-hidden="true"><line x1="0" y1="3.5" x2="22" y2="3.5" stroke={FOLD_COLORS.mountain} strokeWidth="2" /></svg>Mountain</span>
             <span><svg width="22" height="7" aria-hidden="true"><line x1="0" y1="3.5" x2="22" y2="3.5" stroke={FOLD_COLORS.valley} strokeWidth="2" strokeDasharray="7 4" /></svg>Valley</span>
@@ -2290,7 +2483,7 @@ export default function PlanterStudio({ onStatus }: { onStatus?: (status: Studio
               </div>
             </div>
             <p className="footnote">
-              {style.recommendedMaterial === materialId
+              {style.recommendedMaterial === parameters.material
                 ? `${material.shortName} is the recommended stock for ${style.name}.`
                 : `${style.name} is usually cut from ${getMaterial(style.recommendedMaterial).shortName}.`}
             </p>

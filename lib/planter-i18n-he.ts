@@ -10,10 +10,14 @@
  * dimension.
  */
 import { getMaterial } from './pattern-engine';
+// Geometry, not copy: how few parts a wall can be cut into is a fact about the
+// solid, and working it out a second time here would be a second answer waiting
+// to disagree with the studio's.
+import { bitMismatch, planterSplit } from './planter-engine';
 import { CUSTOM_PALETTE, DEFAULT_GROUT } from './planter-print';
 import { getPlanterStyle } from './planter-styles';
 import type {
-  FabricationCheck, MaterialId, MaterialSpec, PlanterLed, PlanterLedController,
+  FabricationCheck, MaterialId, PlanterLed, PlanterLedController,
   PlanterLedEffect, PlanterLedPosition, PlanterModel, PlanterPrint, PlanterPrintFit,
   PlanterPrintRule, PlanterStoneSeal, Vec2, Vec3,
 } from './types';
@@ -376,8 +380,11 @@ function area(points: Vec2[]): number {
  * model, so a check can never claim one dimension in English and another in
  * Hebrew.
  */
-export function checkHe(check: FabricationCheck, model: PlanterModel, material: MaterialSpec): { title: string; detail: string } {
+/** The stock comes off the model, so this can never translate a check about one
+ *  material into a sentence about another. */
+export function checkHe(check: FabricationCheck, model: PlanterModel): { title: string; detail: string } {
   const p = model.parameters;
+  const material = model.material;
   const short = materialShortHe(material.id);
   const minTab = Math.ceil(material.thickness * 4);
 
@@ -388,7 +395,7 @@ export function checkHe(check: FabricationCheck, model: PlanterModel, material: 
       const size = over ? `${Math.ceil(over.width)} × ${Math.ceil(over.height)}` : '';
       return {
         title: 'חלק גדול מגיליון החומר',
-        detail: `${name} דורש ${size} מ״מ, אבל הגיליון הוא רק ${p.sheetWidth} × ${p.sheetHeight} מ״מ. הקטן את האדנית, הורד חישוק, או עבור לבנייה בחישוקים — רצועות נפרדות קטנות בהרבה מפריסה אחת ארוכה.`,
+        detail: `${name} דורש ${size} מ״מ, אבל הגיליון הוא רק ${p.sheetWidth} × ${p.sheetHeight} מ״מ. הקטן את האדנית, הורד חישוק, או חתוך את הדופן לחלקים — פיצול אוטומטי או חישוקים — כי רצועות נפרדות קטנות בהרבה מפריסה אחת ארוכה.`,
       };
     }
     case 'sheet-count':
@@ -409,23 +416,50 @@ export function checkHe(check: FabricationCheck, model: PlanterModel, material: 
       };
     }
     case 'development': {
-      const bulged = Math.abs(p.bulge) > 0.5;
-      const culprit = bulged
-        ? 'דופן נפוחה היא דופן מעוקלת, ולכן אין פריסה שטוחה אחת שמתקפלת אליה. עבור לבנייה בחישוקים — כל חישוק נפרש במדויק והטבעות מסומררות זו לזו.'
+      const culprit = Math.abs(p.bulge) > 0.5
+        ? 'דופן נפוחה היא דופן מעוקלת, ולכן אין פריסה שטוחה אחת שמתקפלת אליה.'
         : p.footprint === 'rectangle' && getPlanterStyle(p.style).offsetStep > 0
-          ? 'הסטת הטבעות במלבן מעבירה צלעות ארוכות אל קצרות, וזה מעקם את הדופן. רבע את המידות, בחר בסגנון פאה ישרה, או עבור לבנייה בחישוקים.'
+          ? 'הסטת הטבעות במלבן מעבירה צלעות ארוכות אל קצרות, וזה מעקם את הדופן. רבע את המידות או בחר בסגנון פאה ישרה כדי להישאר בפריסה אחת.'
           : p.rhythm > 1
-            ? 'מקצב חישוקים הוא חינם על דופן ישרה ונאבק בחידוד. יישר את החידוד, הנמך את המקצב, או עבור לבנייה בחישוקים.'
-            : 'הרפה מהחידוד או ממספר החישוקים, או עבור לבנייה בחישוקים.';
+            ? 'מקצב חישוקים הוא חינם על דופן ישרה ונאבק בחידוד. יישר את החידוד או הנמך את המקצב כדי להישאר בפריסה אחת.'
+            : 'הרפה מהחידוד או ממספר החישוקים כדי להישאר בפריסה אחת.';
+      const parts = planterSplit(model).length;
+      const cost = parts === 1
+        ? 'עבור ל״פיצול אוטומטי״ והיא בכל זאת תצא כפריסה אחת.'
+        : `עבור ל״פיצול אוטומטי״: ${parts} חלקים, ${parts === 2 ? 'קו סימור אחד' : `${parts - 1} קווי סימור`}, וכל שאר הטבעות נשארות חריצה ולא חיתוך.`;
       return {
         title: 'הפאות לא יישבו שטוח בלי מתיחה',
-        detail: `פרישת הדופן הזו כפריסה אחת משאירה ${model.developmentError.toFixed(1)} מ״מ של אי־התאמה בקצוות. ${culprit}`,
+        detail: `פרישת הדופן הזו כפריסה אחת משאירה ${model.developmentError.toFixed(1)} מ״מ של אי־התאמה בקצוות, וחומר הגלם אינו נמתח — כלומר הפריסה פשוט במידה לא נכונה לאדנית, וכך גם כל מספר שנמדד ממנה: השטח, המשקל והקינון. ${culprit} ${cost}`,
       };
     }
     case 'heat-bend':
       return {
         title: `אי אפשר לחרוץ ${short} בחריץ V`,
         detail: `אקריל מתנפץ בקיפול חד. כופף כל קיפול בחום מעל תבנית ברדיוס ${material.minRadius} מ״מ, והתייחס לפריסה כאל תכנית כיפוף ולא כמסלול חריצה.`,
+      };
+    case 'v-bit': {
+      // Geometry, not copy: which creases the fitted bit misses is a fact about
+      // the pot, and working it out a second time here would be a second answer
+      // waiting to disagree with the studio's.
+      const missed = bitMismatch(model);
+      const worst = missed[0];
+      if (!worst) return { title: check.title, detail: check.detail };
+      const near = Math.max(5, Math.round(worst.bend / 5) * 5);
+      const count = missed.length === 1 ? 'קו חריצה אחד מתקפל' : `${missed.length} קווי חריצה מתקפלים`;
+      return worst.bit > worst.bend
+        ? {
+          title: `סכין ${worst.bit}° לא תסגור את הקיפולים האלה`,
+          detail: `${count} פחות ממה שהסכין משוחזת אליו — הפער הגדול הוא קיפול של ${worst.bend.toFixed(0)}° בחריץ של ${worst.bit}°, שנתקע כשנשארו עוד ${(worst.bit - worst.bend).toFixed(0)}°. אין שם שום עצירה מכנית לפינה, היא חוזרת אחורה והתפר לבדו מחזיק אותה. התקן סכין ${near}°, או העבר את הסכין ל״אוטומטי״ וכל קו יישא על השרטוט את הזווית שלו.`,
+        }
+        : {
+          title: `סכין ${worst.bit}° לא מגיעה לקיפולים האלה`,
+          detail: `${count} יותר ממה שהסכין פותחת — קיפול של ${worst.bend.toFixed(0)}° לא ייעשה בחריץ של ${worst.bit}°, כי לחריץ נגמרת הזווית ${(worst.bend - worst.bit).toFixed(0)}° לפני הסוף ושתי הפאות נפגשות לפני שהלוח הגיע לצורה. התקן סכין ${near}°, או העבר את הסכין ל״אוטומטי״.`,
+        };
+    }
+    case 'groove-width':
+      return {
+        title: 'החריץ רחב ביחס לפאות האלה',
+        detail: `חריץ של ${model.groove.width.toFixed(1)} מ״מ, ${model.groove.depth.toFixed(1)} מ״מ עומק על ${short}, לוקח נתח גדול מהפאה — כמעט לא נשאר בה משטח שטוח בין חריץ לחריץ. פחות חישוקים או פחות פאות, סכין צרה יותר, או חומר דק יותר.`,
       };
     case 'joint-tab':
       return {
@@ -677,9 +711,9 @@ export function checkHe(check: FabricationCheck, model: PlanterModel, material: 
       };
     }
     case 'ready': {
-      const how = p.construction === 'banded'
-        ? `${p.rows} ${p.rows === 1 ? 'חישוק מסומרר' : 'חישוקים מסומררים'}`
-        : `${p.rows} ${p.rows === 1 ? 'חישוק' : 'חישוקים'} מפריסה אחת`;
+      const how = model.joints === 0
+        ? `${p.rows} ${p.rows === 1 ? 'חישוק' : 'חישוקים'} מפריסה אחת`
+        : `${p.rows} ${p.rows === 1 ? 'חישוק' : 'חישוקים'} ב־${model.parts.length} חלקים מסומררים`;
       const cutOuts = model.perfCells.reduce(
         (count, facet) => count + facet.cells.length + facet.flaps.length, 0,
       );
@@ -700,8 +734,8 @@ export function checkHe(check: FabricationCheck, model: PlanterModel, material: 
 }
 
 /** Every check in the list, rewritten in Hebrew. */
-export const checksHe = (checks: FabricationCheck[], model: PlanterModel, material: MaterialSpec): FabricationCheck[] =>
-  checks.map((check) => ({ ...check, ...checkHe(check, model, material) }));
+export const checksHe = (checks: FabricationCheck[], model: PlanterModel): FabricationCheck[] =>
+  checks.map((check) => ({ ...check, ...checkHe(check, model) }));
 
 /** Engine stats carry their units inside the string; these are the mm/m/L swaps. */
 export const unitsHe = (value: string) => value

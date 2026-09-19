@@ -15,7 +15,6 @@ import { checksHe, STONE_HE } from './planter-i18n-he';
 import { getMaterial } from './pattern-engine';
 import type { PlanterModel, PlanterParameters, PlanterPiece, Vec2 } from './types';
 
-const acp = getMaterial('acp-4');
 const build = (overrides: Partial<PlanterParameters> = {}) => buildPlanterModel({ ...DEFAULT_PLANTER, ...overrides });
 const everyPreset = [...PLANTER_PRESETS, BLANK_PLANTER];
 
@@ -142,7 +141,7 @@ describe('development', () => {
   it('reports the stretch instead of hiding it when one blank cannot hold the shape', () => {
     const model = build({ style: 'crystal', topDiameter: 380, bottomDiameter: 320, rows: 4, bulge: 25 });
     expect(model.developmentError).toBeGreaterThan(0.8);
-    expect(getPlanterChecks(model, acp).map((check) => check.id)).toContain('development');
+    expect(getPlanterChecks(model).map((check) => check.id)).toContain('development');
   });
 
   // A band is a chain of facets, never a loop, so it always flattens exactly —
@@ -157,7 +156,90 @@ describe('development', () => {
     const model = build({ construction: 'banded', rows: 4, ...(p as Partial<PlanterParameters>) });
     expect(isometryError(model)).toBeLessThan(1e-6);
     expect(model.developmentError).toBeLessThan(1e-6);
-    expect(getPlanterChecks(model, acp).map((check) => check.id)).not.toContain('development');
+    expect(getPlanterChecks(model).map((check) => check.id)).not.toContain('development');
+  });
+
+  // The stock is rigid. A blank that does not develop is not a blank that needs
+  // care on the bench — it is the wrong size for the pot, and cannot be folded
+  // into it at all. So the split has to land on zero, not on "better".
+  it.each([
+    { name: 'bulged', p: { bulge: 28 } },
+    { name: 'waisted', p: { bulge: -30 } },
+    { name: 'bulged and tapered', p: { bulge: 24, topDiameter: 420, bottomDiameter: 280 } },
+    { name: 'bulged with a rhythm', p: { bulge: 20, style: 'diamond', rhythm: 34 } },
+    { name: 'bulged rectangle', p: { bulge: 22, footprint: 'rectangle' } },
+    { name: 'tapered with a rhythm', p: { rhythm: 40, topDiameter: 420, bottomDiameter: 250 } },
+  ])('a split build folds without stretching when $name', ({ p }) => {
+    const over = { rows: 4, ...(p as Partial<PlanterParameters>) };
+    expect(build({ construction: 'single-sheet', ...over }).developmentError).toBeGreaterThan(0.8);
+
+    const model = build({ construction: 'split', ...over });
+    expect(model.developmentError).toBeLessThanOrEqual(0.8);
+    expect(getPlanterChecks(model).map((check) => check.id)).not.toContain('development');
+  });
+
+  it('cuts the wall only where the curvature is, never for the sake of it', () => {
+    // A straight tapered prism develops as one blank, so a split must not invent
+    // a rivet line: the same pot, the same single part, whichever mode is asked
+    // for. Cutting a joint that carries nothing costs hardware and labour and
+    // buys exactly nothing.
+    const straight = { style: 'prism', rhythm: 0, twist: 0, bulge: 0, rows: 4 } as Partial<PlanterParameters>;
+    expect(build({ ...straight, construction: 'split' }).parts).toEqual([{ from: 0, to: 3 }]);
+    expect(build({ ...straight, construction: 'split' }).joints).toBe(0);
+    expect(build({ ...straight, construction: 'banded' }).joints).toBe(3);
+
+    // And on a wall that is curved, it is never worse than cutting every joint.
+    for (const rows of [3, 4, 5, 6]) {
+      const curved = { bulge: 20, rows } as Partial<PlanterParameters>;
+      const split = build({ ...curved, construction: 'split' });
+      expect(split.parts.length).toBeLessThanOrEqual(rows);
+      // Every band belongs to exactly one part, in order, with no band missed.
+      expect(split.parts[0].from).toBe(0);
+      expect(split.parts[split.parts.length - 1].to).toBe(rows - 1);
+      split.parts.forEach((part, i) => {
+        expect(part.to).toBeGreaterThanOrEqual(part.from);
+        if (i > 0) expect(part.from).toBe(split.parts[i - 1].to + 1);
+      });
+    }
+  });
+
+  it('draws the blank at the size the pot actually is', () => {
+    // The wall's area is the material bought, and it is measured off the net. A
+    // net that does not develop is smaller than the pot it claims to make, so a
+    // stretched design under-quotes the stock — which is the defect the fold
+    // preview shows as facets coming apart along lines that are only grooved.
+    const over = { bulge: 20, rows: 4 } as Partial<PlanterParameters>;
+    const area = (model: PlanterModel) => {
+      const stride = model.parameters.sides + 1;
+      const per = model.parameters.sides * 2;
+      const flat = (band: number, id: number) => model.flatByBand[band][Math.floor(id / stride) - band][id % stride];
+      const solid = (id: number) => model.vertices[Math.floor(id / stride)][id % stride];
+      let net = 0;
+      let built = 0;
+      model.triangles.forEach((triangle, t) => {
+        const band = Math.floor(t / per);
+        const [a, b, c] = triangle.v.map((id) => flat(band, id));
+        net += Math.abs((b.x - a.x) * (c.y - a.y) - (c.x - a.x) * (b.y - a.y)) / 2;
+        const [p, q, r] = triangle.v.map(solid);
+        const u = { x: q.x - p.x, y: q.y - p.y, z: q.z - p.z };
+        const v = { x: r.x - p.x, y: r.y - p.y, z: r.z - p.z };
+        built += Math.hypot(
+          u.y * v.z - u.z * v.y, u.z * v.x - u.x * v.z, u.x * v.y - u.y * v.x,
+        ) / 2;
+      });
+      return { net, built };
+    };
+
+    // Relative, because that is how the error is spent: a percentage of the
+    // stock ordered, not a fixed number of square millimetres.
+    const stretched = area(build({ ...over, construction: 'single-sheet' }));
+    expect(stretched.net / stretched.built).toBeLessThan(0.99);
+
+    // A split still carries whatever mismatch DEVELOPMENT_TOLERANCE allows, so
+    // this is not bit-exact — but a twentieth of a percent of the sheet is inside
+    // the saw kerf, never mind the order.
+    const split = area(build({ ...over, construction: 'split' }));
+    expect(Math.abs(split.net / split.built - 1)).toBeLessThan(0.0005);
   });
 
   it('turns the ring creases of a banded build into rivet joints', () => {
@@ -235,7 +317,14 @@ describe('footprint', () => {
       footprint: 'rectangle', style: 'prism', rows: 1, height: 500, twist: 0,
       topWidth: 400, topLength: 300, bottomWidth: 400, bottomLength: 300,
     });
-    expect(planterVolumeLitres(model)).toBeCloseTo((400 * 300 * 500) / 1_000_000, 6);
+    // Measured inside the wall and off the floor, because that is where the soil
+    // goes. On 4 mm stock a 400 x 300 box is 392 x 292 inside, and the base plate
+    // takes the first 4 mm of the height.
+    const t = model.solid.thickness;
+    expect(planterVolumeLitres(model)).toBeCloseTo(((400 - 2 * t) * (300 - 2 * t) * (500 - t)) / 1_000_000, 6);
+    // The old answer is still worked out, and still the larger of the two: it is
+    // what a shell with no thickness would have claimed, and it is 5% out.
+    expect(model.solid.surfaceLitres).toBeCloseTo((400 * 300 * 500) / 1_000_000, 6);
   });
 
   it('tapers width and length independently', () => {
@@ -287,7 +376,7 @@ describe('pieces', () => {
     expect(plate(loose).width).toBeLessThan(plate(tight).width);
     // Inset is measured off the edge, so a box loses exactly twice it across.
     const box = (inset: number) => plate(build({ footprint: 'rectangle', baseInset: inset, bottomWidth: 400 })).width;
-    expect(box(0) - box(10)).toBeCloseTo(20, 6);
+    expect(box(6) - box(16)).toBeCloseTo(20, 6);
   });
 
   it('opens the collar wider as the rim narrows', () => {
@@ -420,40 +509,116 @@ describe('pieces', () => {
 describe('reporting', () => {
   it('measures a hexagonal prism against the closed-form volume', () => {
     const model = build({ style: 'prism', sides: 6, topDiameter: 400, bottomDiameter: 400, height: 500, rows: 1 });
-    // A regular hexagon of circumradius r has area 3√3/2 · r².
-    const expected = (((3 * Math.sqrt(3)) / 2) * 200 * 200 * 500) / 1_000_000;
-    expect(planterVolumeLitres(model)).toBeCloseTo(expected, 6);
+    // A regular hexagon of circumradius r has area 3√3/2 · r². The inside of the
+    // wall is not r - t: offsetting two facets that meet at a 120° corner puts
+    // the inside corner back by the mitre, t / cos(30°), which is 15% further.
+    const t = model.solid.thickness;
+    const area = (r: number) => ((3 * Math.sqrt(3)) / 2) * r * r;
+    expect(planterVolumeLitres(model)).toBeCloseTo((area(200 - t / Math.cos(Math.PI / 6)) * (500 - t)) / 1_000_000, 6);
+    expect(model.solid.surfaceLitres).toBeCloseTo((area(200) * 500) / 1_000_000, 6);
   });
 
   it('counts two facets per side per band, and the parts on the sheet', () => {
-    expect(getPlanterStats(build({ sides: 6, rows: 3 }), acp).facets).toBe(36);
-    expect(getPlanterStats(build({ rows: 4, construction: 'single-sheet' }), acp).pieces).toBe(3);
-    expect(getPlanterStats(build({ rows: 4, construction: 'banded' }), acp).pieces).toBe(6);
+    expect(getPlanterStats(build({ sides: 6, rows: 3 })).facets).toBe(36);
+    expect(getPlanterStats(build({ rows: 4, construction: 'single-sheet' })).pieces).toBe(3);
+    expect(getPlanterStats(build({ rows: 4, construction: 'banded' })).pieces).toBe(6);
   });
 
   it('flags a net that will not fit the stock sheet', () => {
     const model = build({ topDiameter: 900, bottomDiameter: 800, height: 1400, sheetWidth: 600, sheetHeight: 600 });
-    expect(getPlanterChecks(model, acp).find((check) => check.id === 'sheet-fit')?.severity).toBe('error');
+    expect(getPlanterChecks(model).find((check) => check.id === 'sheet-fit')?.severity).toBe('error');
   });
 
   it('flags a collar that would close over the planting hole', () => {
-    expect(getPlanterChecks(build({ topDiameter: 300, rimWidth: 140 }), acp).map((check) => check.id)).toContain('rim-width');
+    expect(getPlanterChecks(build({ topDiameter: 300, rimWidth: 140 })).map((check) => check.id)).toContain('rim-width');
   });
 
   it('flags rivet tabs too short to land a rivet clear of the fold', () => {
-    const ids = getPlanterChecks(build({ construction: 'banded', rows: 3, jointTab: 8 }), acp).map((check) => check.id);
+    const ids = getPlanterChecks(build({ construction: 'banded', rows: 3, jointTab: 8 })).map((check) => check.id);
     expect(ids).toContain('joint-tab');
-    expect(getPlanterChecks(build({ construction: 'banded', rows: 3, jointTab: 25 }), acp).map((c) => c.id)).not.toContain('joint-tab');
+    expect(getPlanterChecks(build({ construction: 'banded', rows: 3, jointTab: 25 })).map((c) => c.id)).not.toContain('joint-tab');
+  });
+
+  // A V-groove shuts on itself after turning through exactly its own included
+  // angle. So the bit is not a setting beside the fold — it IS the fold, and a
+  // mismatch is a corner with no mechanical stop in it.
+  it('says when the fitted bit cannot close the folds it is given', () => {
+    // A square box folds 90° at every corner. Fit the 120° bit a sign shop
+    // already owns and the groove bottoms out with 30° still to go.
+    const wide = getPlanterChecks(build({ footprint: 'rectangle', style: 'prism', rows: 1, vBitAngle: 120 }));
+    const check = wide.find((one) => one.id === 'v-bit');
+    expect(check?.severity).toBe('warning');
+    expect(check?.detail).toContain('90');
+    expect(check?.detail).toContain('120');
+  });
+
+  it('tells a bit that cannot reach from one that will not close', () => {
+    // Different failures and different fixes, so they must not read alike. Too
+    // wide leaves the corner soft; too narrow cannot make the angle at all, and
+    // that is a part which does not exist rather than one which is springy.
+    const narrow = getPlanterChecks(build({ footprint: 'rectangle', style: 'prism', rows: 1, vBitAngle: 45 }))
+      .find((one) => one.id === 'v-bit');
+    expect(narrow?.severity).toBe('error');
+    const wide = getPlanterChecks(build({ footprint: 'rectangle', style: 'prism', rows: 1, vBitAngle: 120 }))
+      .find((one) => one.id === 'v-bit');
+    expect(wide?.severity).toBe('warning');
+    expect(narrow?.title).not.toBe(wide?.title);
+  });
+
+  it('never complains about the bit when every crease gets its own', () => {
+    // Which is the point of the auto bit, and why it is the default: the drawing
+    // carries the angle line by line instead of one bit having to suit them all.
+    for (const overrides of [{}, { sides: 6, rows: 3 }, { footprint: 'rectangle' as const }, { sides: 12, rows: 4 }]) {
+      const ids = getPlanterChecks(build({ ...overrides, vBitAngle: 0 })).map((one) => one.id);
+      expect(ids).not.toContain('v-bit');
+    }
+  });
+
+  it('never talks about bits at all for stock that is bent hot', () => {
+    const ids = getPlanterChecks(build({ material: 'acrylic-3', footprint: 'rectangle', rows: 1, vBitAngle: 120 }))
+      .map((one) => one.id);
+    expect(ids).not.toContain('v-bit');
+    expect(ids).not.toContain('groove-width');
+    expect(ids).toContain('heat-bend');
+  });
+
+  it('says when the groove is too wide for the facets it is cut into', () => {
+    // Twelve sides and five bands makes facets a fraction of a box's, and a 135°
+    // bit on 4 mm stock cuts a 13.5 mm groove. Little flat face survives that.
+    const crowded = build({ sides: 12, rows: 5, topDiameter: 260, bottomDiameter: 220, vBitAngle: 135 });
+    expect(getPlanterChecks(crowded).map((one) => one.id)).toContain('groove-width');
+    const roomy = build({ sides: 4, rows: 1, vBitAngle: 45 });
+    expect(getPlanterChecks(roomy).map((one) => one.id)).not.toContain('groove-width');
+  });
+
+  it('cuts the groove to the stock, never through the hinge', () => {
+    for (const material of ['acp-4', 'acp-3', 'steel-2', 'cardboard-2'] as const) {
+      const model = build({ material });
+      // Depth plus skin is the sheet: the bit stops at the hinge, and the hinge
+      // is what makes this one folded panel rather than two riveted ones.
+      expect(model.groove.depth + model.groove.skin).toBeCloseTo(model.material.thickness, 9);
+      expect(model.groove.skin).toBeGreaterThan(0);
+    }
+  });
+
+  it('opens the groove wider as the bit gets blunter', () => {
+    const at = (bit: number) => build({ vBitAngle: bit }).groove.width;
+    expect(at(45)).toBeLessThan(at(90));
+    expect(at(90)).toBeLessThan(at(135));
+    // 2 · depth · tan(half the bit) — the cut is a V, so the width is the depth
+    // opened out by the angle and nothing else.
+    const model = build({ vBitAngle: 90 });
+    expect(model.groove.width).toBeCloseTo(2 * model.groove.depth * Math.tan(Math.PI / 4), 9);
   });
 
   it('clears a stock design outright', () => {
     const model = build({ style: 'prism', sides: 6, topDiameter: 400, bottomDiameter: 340, height: 500, rows: 1 });
-    expect(getPlanterChecks(model, acp)).toEqual([expect.objectContaining({ id: 'ready', severity: 'info' })]);
+    expect(getPlanterChecks(model)).toEqual([expect.objectContaining({ id: 'ready', severity: 'info' })]);
   });
 
   it('gives every check enough detail to act on', () => {
     for (const preset of everyPreset) {
-      for (const check of getPlanterChecks(build(preset.parameters), acp)) {
+      for (const check of getPlanterChecks(build(preset.parameters))) {
         expect(check.detail.length).toBeGreaterThan(20);
       }
     }
@@ -463,7 +628,7 @@ describe('reporting', () => {
 describe('output', () => {
   it('writes millimetre-true SVG carrying the fold notation', () => {
     const model = build();
-    const svg = buildPlanterSvg(model, acp, 'Diamond Relief');
+    const svg = buildPlanterSvg(model, 'Diamond Relief');
     expect(svg).toContain('xmlns="http://www.w3.org/2000/svg"');
     expect(svg).toMatch(/width="[\d.]+mm" height="[\d.]+mm"/);
     expect(svg).toContain('Solid = mountain');
@@ -472,15 +637,113 @@ describe('output', () => {
   });
 
   it('says in the file which way the pot is built', () => {
-    expect(buildPlanterSvg(build({ construction: 'banded', rows: 4 }), acp, 'Crystal')).toContain('3 riveted ring joints');
-    expect(buildPlanterSvg(build({ construction: 'single-sheet' }), acp, 'Crystal')).toContain('Single-sheet build');
+    const banded = buildPlanterSvg(build({ construction: 'banded', rows: 4 }), 'Crystal');
+    expect(banded).toContain('3 riveted ring joints');
+    // The drawing has to say which lines the cutter parts and which it only
+    // grooves: on a wall in parts those are different rings, and nothing in the
+    // geometry alone tells them apart.
+    expect(banded).toContain('groove it, do not cut it');
+    expect(buildPlanterSvg(build({ construction: 'single-sheet' }), 'Crystal')).toContain('One wall blank');
   });
 
   it('writes DXF R12 with a layer per fold kind', () => {
-    const dxf = buildPlanterDxf(build());
+    // One bit fitted for the whole job, so every groove goes to the same tool
+    // and the layer names are the ones a shop already has set up for it.
+    const dxf = buildPlanterDxf(build({ vBitAngle: 90 }));
     for (const layer of ['CUT', 'MOUNTAIN', 'VALLEY']) expect(dxf).toContain(`\n${layer}\n`);
     expect(dxf.trimEnd().endsWith('EOF')).toBe(true);
     expect(dxf).not.toMatch(/NaN|Infinity/);
+  });
+
+  it('names the bit on every groove when each crease needs its own', () => {
+    // A groove shuts after turning through its own included angle, so a drawing
+    // that says 'fold here' without saying how far cannot be machined: nothing
+    // tells the operator which of forty lines wants which tool.
+    const model = build({ vBitAngle: 0, sides: 6, rows: 3 });
+    const dxf = buildPlanterDxf(model);
+    const layers = [...new Set([...dxf.matchAll(/\n(MOUNTAIN|VALLEY)-(\d+)\n/g)].map(([, kind, deg]) => `${kind}-${deg}`))];
+    expect(layers.length).toBeGreaterThan(0);
+    expect(dxf).not.toMatch(/\n(MOUNTAIN|VALLEY)\n/);
+
+    // And the angle on the layer is the angle of a fold that is really there,
+    // to the nearest step a bit is ground to.
+    const bends = model.pieces.flatMap((piece) => piece.folds)
+      .filter((fold) => fold.kind !== 'cut' && fold.bend !== undefined)
+      .map((fold) => Math.max(5, Math.round((fold.bend as number) / 5) * 5));
+    for (const layer of layers) expect(bends).toContain(Number(layer.split('-')[1]));
+
+    // Every layer the table declares carries something. A declared layer with
+    // nothing on it is a tool an operator sets up for no reason.
+    const declared = [...dxf.matchAll(/\nLAYER\n2\n([A-Z0-9-]+)\n/g)].map(([, name]) => name);
+    for (const name of declared) expect(dxf).toContain(`\nVERTEX\n8\n${name}\n`);
+  });
+
+  it('will not chain two creases that want different tools into one groove', () => {
+    // Joined up, the run would be grooved in a single pass at whichever angle was
+    // read first — so the split by tool has to happen before the lines are chained.
+    const dxf = buildPlanterDxf(build({ vBitAngle: 0, sides: 6, rows: 3, rhythm: 55 }));
+    const blocks = dxf.split('\nPOLYLINE\n8\n').slice(1);
+    expect(blocks.length).toBeGreaterThan(3);
+    for (const block of blocks) {
+      const layer = block.slice(0, block.indexOf('\n'));
+      for (const [, on] of block.matchAll(/\nVERTEX\n8\n([A-Z0-9-]+)\n/g)) expect(on).toBe(layer);
+    }
+  });
+
+  // The board lies on the bed decorative side DOWN, because the V-groove is cut
+  // through the back skin. Send the outside view to that machine and every part
+  // comes off handed the wrong way — and on a composite panel that is scrap.
+  it('lays the cut file out for the face the cutter actually sees', () => {
+    // Twisted, so the pot has a hand and the mirror is not a no-op.
+    const model = build({ twist: 40, rows: 3 });
+    const xs = (dxf: string) => [...dxf.matchAll(/VERTEX\n8\n\w+\n10\n([-\d.]+)\n/g)].map(([, x]) => Number(x));
+
+    const groove = xs(buildPlanterDxf(model, 'groove'));
+    const outside = xs(buildPlanterDxf(model, 'outside'));
+    expect(groove).toHaveLength(outside.length);
+    expect(groove).not.toEqual(outside);
+    // Reflected about the nest's own edge, point for point and in order. The
+    // file writes millimetres to three places and both sides of the comparison
+    // are rounded, so two of those roundings is the honest tolerance.
+    groove.forEach((x, i) => {
+      expect(Math.abs(x - (model.sheet.width - outside[i]))).toBeLessThan(0.002);
+    });
+    // Which means it is still the same nest on the same stock, not one shifted
+    // off the sheet: a mirror that needed a bigger board would be no use.
+    expect(Math.min(...groove)).toBeGreaterThanOrEqual(-0.002);
+    expect(Math.max(...groove)).toBeLessThanOrEqual(model.sheet.width + 0.002);
+
+    // Mirroring twice is the identity, so nothing is quietly lost in the round trip.
+    expect(buildPlanterDxf(model, 'groove')).not.toEqual(buildPlanterDxf(model, 'outside'));
+    // And the groove face is what you get without asking, because that is the
+    // file the shop cuts.
+    expect(buildPlanterDxf(model)).toEqual(buildPlanterDxf(model, 'groove'));
+  });
+
+  it('says on the drawing which way round it is, and never mirrors the print', () => {
+    const model = build({ twist: 40, rows: 3, print: 'triangles', printPalette: 'carnival' });
+    expect(buildPlanterSvg(model, 'Crystal', 'groove')).toContain('MIRRORED');
+    expect(buildPlanterSvg(model, 'Crystal', 'outside')).toContain('NOT mirrored');
+    // The ink goes on the face that shows, so the print layout is the outside
+    // view whatever the cut file is doing — and it has to say so, because the
+    // two files reach the shop together.
+    expect(buildPlanterPrintSvg(model, 'Crystal')).toContain('NOT mirrored');
+  });
+
+  it('keeps part labels readable on the mirrored drawing', () => {
+    const model = build({ twist: 40, rows: 3 });
+    const svg = buildPlanterSvg(model, 'Crystal', 'groove');
+    // Glyphs must not reflect — only the y-flip the whole drawing already has.
+    for (const text of svg.match(/<text [^>]*>/g) ?? []) {
+      expect(text).toContain('transform="scale(1,-1)"');
+    }
+    // And each label still sits on its own part rather than off the far edge.
+    const labelXs = [...svg.matchAll(/<text x="([-\d.]+)"/g)].map(([, x]) => Number(x));
+    expect(labelXs.length).toBe(model.pieces.length);
+    for (const x of labelXs) {
+      expect(x).toBeGreaterThanOrEqual(0);
+      expect(x).toBeLessThanOrEqual(model.sheet.width);
+    }
   });
 
   it('writes every run as one entity instead of a line per segment', () => {
@@ -489,7 +752,7 @@ describe('output', () => {
     const dxf = buildPlanterDxf(build({ construction: 'single-sheet', sides: 6, rows: 3 }));
     expect(dxf).not.toContain('\nLINE\n');
     expect(dxf).toContain('\nPOLYLINE\n');
-    const svg = buildPlanterSvg(build({ construction: 'single-sheet', sides: 6, rows: 3 }), acp, 'Diamond Relief');
+    const svg = buildPlanterSvg(build({ construction: 'single-sheet', sides: 6, rows: 3 }), 'Diamond Relief');
     expect(svg).not.toMatch(/<line /);
   });
 
@@ -499,7 +762,7 @@ describe('output', () => {
     // Bit 1 of group 70 is the closed flag; every piece contributes one outline.
     const closed = dxf.match(/\nPOLYLINE\n8\n[A-Z]+\n66\n1\n70\n1\n/g) ?? [];
     expect(closed.length).toBeGreaterThanOrEqual(model.pieces.length);
-    expect(buildPlanterSvg(model, acp, 'Diamond Relief')).toContain('<polygon');
+    expect(buildPlanterSvg(model, 'Diamond Relief')).toContain('<polygon');
   });
 
   it('never writes the same crease twice', () => {
@@ -736,8 +999,8 @@ describe('perforated wall', () => {
     const model = build(LIT);
     const cells = model.perfCells.reduce((count, facet) => count + facet.cells.length, 0);
     expect(cells).toBeGreaterThan(0);
-    const svg = buildPlanterSvg(model, acp, 'Crystal Facet');
-    const solid = buildPlanterSvg(build(), acp, 'Crystal Facet');
+    const svg = buildPlanterSvg(model, 'Crystal Facet');
+    const solid = buildPlanterSvg(build(), 'Crystal Facet');
     expect((svg.match(/<polygon/g) ?? []).length - (solid.match(/<polygon/g) ?? []).length)
       .toBeGreaterThanOrEqual(cells);
     // R12 closes a run with bit 1 of group 70, so a cut-out arriving open would
@@ -749,13 +1012,13 @@ describe('perforated wall', () => {
 
   it('reports what it opened up, and says so in the shop notes', () => {
     const model = build(LIT);
-    const stats = getPlanterStats(model, acp);
+    const stats = getPlanterStats(model);
     const cells = model.perfCells.reduce((count, facet) => count + facet.cells.length, 0);
     expect(stats.openArea).toBe(`${Math.round(model.perfOpenArea * 100)}% open · ${cells} cut-outs`);
     expect(model.perfOpenArea).toBeGreaterThan(0);
     expect(model.perfOpenArea).toBeLessThan(1);
-    expect(getPlanterStats(build(), acp).openArea).toBeUndefined();
-    expect(buildPlanterSvg(model, acp, 'Crystal Facet')).toContain('milled cut-outs');
+    expect(getPlanterStats(build()).openArea).toBeUndefined();
+    expect(buildPlanterSvg(model, 'Crystal Facet')).toContain('milled cut-outs');
   });
 
   it('keeps the one-click wall decorative rather than structural', () => {
@@ -769,7 +1032,7 @@ describe('perforated wall', () => {
       expect(model.perfCells.length).toBeGreaterThan(0);
       expect(model.perfOpenArea).toBeGreaterThan(0.005);
       expect(model.perfOpenArea).toBeLessThan(0.16);
-      expect(getPlanterChecks(model, acp).some((check) => check.id === 'perf-open')).toBe(false);
+      expect(getPlanterChecks(model).some((check) => check.id === 'perf-open')).toBe(false);
     }
   });
 
@@ -783,7 +1046,7 @@ describe('perforated wall', () => {
     const wide = build({ ...LIT, perfDensity: 1, perfOpening: 70 });
     const narrow = build({ ...LIT, perfDensity: 1, perfOpening: 12 });
     expect(narrow.perfOpenArea).toBeLessThan(wide.perfOpenArea * 0.3);
-    expect(getPlanterChecks(wide, acp).some((check) => check.id === 'perf-open')).toBe(false);
+    expect(getPlanterChecks(wide).some((check) => check.id === 'perf-open')).toBe(false);
 
     // And the web is a floor the opening cannot talk its way past: asking for
     // almost the whole cell still leaves a full web between neighbours.
@@ -827,11 +1090,11 @@ describe('perforated wall', () => {
     }
 
     // The part weighs what it weighed before: a petal is still attached.
-    expect(getPlanterStats(folded, acp).estimatedWeight).toBe(getPlanterStats(solid, acp).estimatedWeight);
+    expect(getPlanterStats(folded).estimatedWeight).toBe(getPlanterStats(solid).estimatedWeight);
     // But there is more cutting to do than on a plain wall.
-    expect(parseFloat(getPlanterStats(folded, acp).cutLength))
-      .toBeGreaterThan(parseFloat(getPlanterStats(solid, acp).cutLength));
-    expect(getPlanterStats(folded, acp).openArea).toContain('nothing removed');
+    expect(parseFloat(getPlanterStats(folded).cutLength))
+      .toBeGreaterThan(parseFloat(getPlanterStats(solid).cutLength));
+    expect(getPlanterStats(folded).openArea).toContain('nothing removed');
   });
 
   it('gives every petal a hinge crease and an open cut, never a closed one', () => {
@@ -855,7 +1118,7 @@ describe('perforated wall', () => {
       }
     }
     // And the exports carry them as open runs.
-    const svg = buildPlanterSvg(model, acp, 'fold');
+    const svg = buildPlanterSvg(model, 'fold');
     expect((svg.match(/<polyline/g) ?? []).length).toBeGreaterThan(0);
   });
 
@@ -908,21 +1171,21 @@ describe('perforated wall', () => {
   });
 
   it('refuses to open a wall with nothing behind it', () => {
-    const open = getPlanterChecks(build({ ...LIT, liner: false }), acp);
+    const open = getPlanterChecks(build({ ...LIT, liner: false }));
     expect(open.find((check) => check.id === 'perf-liner')?.severity).toBe('error');
-    expect(getPlanterChecks(build(LIT), acp).some((check) => check.id === 'perf-liner')).toBe(false);
+    expect(getPlanterChecks(build(LIT)).some((check) => check.id === 'perf-liner')).toBe(false);
   });
 
   it('still wants a liner behind a cut-and-fold wall', () => {
     // Nothing left the sheet, but the openings are just as open.
-    const open = getPlanterChecks(build({ ...BIG, perforation: 'foldout', liner: false }), acp);
+    const open = getPlanterChecks(build({ ...BIG, perforation: 'foldout', liner: false }));
     expect(open.find((check) => check.id === 'perf-liner')?.severity).toBe('error');
   });
 
   it('says so rather than silently cutting nothing', () => {
     const none = build({ ...LIT, perfSkirt: 2000 });
     expect(none.perfCells).toEqual([]);
-    expect(getPlanterChecks(none, acp).some((check) => check.id === 'perf-empty')).toBe(true);
+    expect(getPlanterChecks(none).some((check) => check.id === 'perf-empty')).toBe(true);
   });
 
   it('cuts one facet and stamps it round, so every side carries the same pattern', () => {
@@ -979,7 +1242,7 @@ describe('perforated wall', () => {
     expect(crowded.perfDropped).toBeGreaterThan(0);
     expect(crowded.perfCells.reduce((count, facet) => count + facet.cells.length, 0))
       .toBeLessThan(crowded.parameters.sides * crowded.parameters.rows * 2 * 64);
-    const said = getPlanterChecks(crowded, acp).map((check) => check.id);
+    const said = getPlanterChecks(crowded).map((check) => check.id);
     expect(said.includes('perf-tool') || said.includes('perf-empty')).toBe(true);
   });
 });
@@ -1010,9 +1273,12 @@ describe('soil liner', () => {
         const u = step / 20;
         const z = model.vertices[k][0].z + (model.vertices[k + 1][0].z - model.vertices[k][0].z) * u;
         if (z > liner.height + 1e-6) continue;
+        // Against the INSIDE of the wall — the face the box actually meets. Read
+        // off the outside, a stated gap would be short by one thickness all round.
+        const inner = model.solid.inner;
         const section = Array.from({ length: sides }, (_, i) => ({
-          x: model.vertices[k][i].x + (model.vertices[k + 1][i].x - model.vertices[k][i].x) * u,
-          y: model.vertices[k][i].y + (model.vertices[k + 1][i].y - model.vertices[k][i].y) * u,
+          x: inner[k][i].x + (inner[k + 1][i].x - inner[k][i].x) * u,
+          y: inner[k][i].y + (inner[k + 1][i].y - inner[k][i].y) * u,
         }));
         for (const corner of liner.section) {
           expect(insideRing(corner, section)).toBe(true);
@@ -1071,15 +1337,15 @@ describe('soil liner', () => {
     const model = build(LIT);
     const liner = model.liner as NonNullable<PlanterModel['liner']>;
     expect(liner.litres).toBeLessThan(planterVolumeLitres(model));
-    expect(getPlanterStats(model, acp).volume).toBe(`≈ ${liner.litres.toFixed(1)} L`);
-    expect(getPlanterStats(build(), acp).volume).toBe(`≈ ${planterVolumeLitres(build()).toFixed(1)} L`);
+    expect(getPlanterStats(model).volume).toBe(`≈ ${liner.litres.toFixed(1)} L`);
+    expect(getPlanterStats(build()).volume).toBe(`≈ ${planterVolumeLitres(build()).toFixed(1)} L`);
   });
 
   it('says there is no room rather than building a box that will not go in', () => {
     const model = build({ sides: 6, topDiameter: 160, bottomDiameter: 150, height: 300, liner: true, cavity: 120 });
     expect(model.liner).toBeNull();
     expect(model.pieces.map((piece) => piece.id)).not.toContain('liner-wall');
-    expect(getPlanterChecks(model, acp).find((check) => check.id === 'liner-fit')?.severity).toBe('error');
+    expect(getPlanterChecks(model).find((check) => check.id === 'liner-fit')?.severity).toBe('error');
   });
 });
 
@@ -1104,7 +1370,7 @@ describe('solar panel', () => {
   it('cuts nothing when the collar cannot carry the panel, and says why', () => {
     const model = build({ ...LIT, rimWidth: 30 });
     expect(model.pieces.find((piece) => piece.id === 'rim')?.holes).toHaveLength(1);
-    const check = getPlanterChecks(model, acp).find((item) => item.id === 'solar-fit');
+    const check = getPlanterChecks(model).find((item) => item.id === 'solar-fit');
     expect(check?.severity).toBe('warning');
     expect(check?.detail).toContain('86 mm');
   });
@@ -1115,13 +1381,13 @@ describe('solar panel', () => {
 });
 
 describe('LED strip', () => {
-  const ids = (model: PlanterModel) => getPlanterChecks(model, acp).map((check) => check.id);
+  const ids = (model: PlanterModel) => getPlanterChecks(model).map((check) => check.id);
 
   it('leaves a design that never asked for a strip completely alone', () => {
     const plain = build();
     expect(plain.parameters.led).toBe('none');
     expect(plain.lighting).toBeNull();
-    const stats = getPlanterStats(plain, acp);
+    const stats = getPlanterStats(plain);
     expect(stats.lighting).toBeUndefined();
     expect(stats.power).toBeUndefined();
     expect(stats.runtime).toBeUndefined();
@@ -1145,8 +1411,12 @@ describe('LED strip', () => {
     const one = build({ ...LIT, led: '3000k', ledRuns: 1 }).lighting!;
     const three = build({ ...LIT, led: '3000k', ledRuns: 3 }).lighting!;
     expect(three.length).toBeCloseTo(one.length * 3, 6);
-    expect(three.leds).toBe(one.leds * 3);
-    expect(three.peakWatts).toBeCloseTo(one.peakWatts * 3, 6);
+    // The count follows the strip rather than the run: emitters come whole, so
+    // three runs of 43.3 is 130 and not three times a rounded 43.
+    expect(three.leds).toBe(Math.round((three.length / 1000) * 60));
+    // And the draw follows the emitters, for the same reason — so what has to
+    // hold across runs is the watts each one costs, not a multiple of the total.
+    expect(three.peakWatts / three.leds).toBeCloseTo(one.peakWatts / one.leds, 9);
   });
 
   it('charges for density without moving the strip', () => {
@@ -1224,7 +1494,7 @@ describe('LED strip', () => {
     const light = model.lighting!;
     expect(light.harvest).toBeGreaterThan(0);
     expect(light.runtime).toBeLessThan(10);
-    const check = getPlanterChecks(model, acp).find((item) => item.id === 'led-solar');
+    const check = getPlanterChecks(model).find((item) => item.id === 'led-solar');
     expect(check?.severity).toBe('warning');
     // The remedy is quoted as a bigger panel than the one fitted.
     const bigger = /about (\d+) . (\d+) mm of panel/.exec(check?.detail ?? '');
@@ -1239,7 +1509,7 @@ describe('LED strip', () => {
     const light = model.lighting!;
     expect(light.harvest).toBeGreaterThan(0);
     expect(light.runtime).toBeGreaterThanOrEqual(fitted.ledHours - 0.05);
-    expect(getPlanterChecks(model, acp).filter((check) => check.id.startsWith('led-'))).toEqual([]);
+    expect(getPlanterChecks(model).filter((check) => check.id.startsWith('led-'))).toEqual([]);
     // And it never claims more than the panel: this is a small panel on a collar.
     expect(fitted.ledBrightness).toBeLessThan(100);
   });
@@ -1251,17 +1521,17 @@ describe('LED strip', () => {
 
   it('carries the strip into the shop notes and the stats, and off again', () => {
     const model = build({ ...LIT, led: '6000k' });
-    const svg = buildPlanterSvg(model, acp, 'Test');
+    const svg = buildPlanterSvg(model, 'Test');
     expect(svg).toContain('6000K daylight');
     expect(svg).toContain('Supply 12 V');
-    const stats = getPlanterStats(model, acp);
+    const stats = getPlanterStats(model);
     expect(stats.lighting).toContain('6000K daylight');
     expect(stats.power).toContain('at 12 V');
     expect(stats.runtime).toContain('Wh/day');
 
     const dark = build({ ...LIT, led: 'none' });
-    expect(buildPlanterSvg(dark, acp, 'Test')).not.toContain('Supply 12 V');
-    expect(getPlanterStats(dark, acp).power).toBeUndefined();
+    expect(buildPlanterSvg(dark, 'Test')).not.toContain('Supply 12 V');
+    expect(getPlanterStats(dark).power).toBeUndefined();
   });
 
   it('clamps every electrical lever to something orderable', () => {
@@ -1291,7 +1561,7 @@ describe('LED strip', () => {
 });
 
 describe('effect modes and where the strip sits', () => {
-  const ids = (model: PlanterModel) => getPlanterChecks(model, acp).map((check) => check.id);
+  const ids = (model: PlanterModel) => getPlanterChecks(model).map((check) => check.id);
   const RGB = { ...LIT, led: 'ws2812' } as Partial<PlanterParameters>;
 
   it('charges a mode for what it actually lights, and the driver for everything', () => {
@@ -1350,13 +1620,13 @@ describe('effect modes and where the strip sits', () => {
 
   it('tells the workshop where to stick it and what to load on the controller', () => {
     const notes = buildPlanterSvg(
-      build({ ...RGB, ledPosition: 'rim', ledEffect: 'comet', ledController: 'wled' }), acp, 'Test',
+      build({ ...RGB, ledPosition: 'rim', ledEffect: 'comet', ledController: 'wled' }), 'Test',
     );
     expect(notes).toContain('under the collar, facing down');
     expect(notes).toContain('WLED controller');
     expect(notes).toContain('Comet');
 
-    const plain = buildPlanterSvg(build({ ...RGB, ledEffect: 'static' }), acp, 'Test');
+    const plain = buildPlanterSvg(build({ ...RGB, ledEffect: 'static' }), 'Test');
     expect(plain).toContain('on the liner face, facing the cut-outs');
     expect(plain).not.toContain('Comet');
   });
@@ -1408,7 +1678,7 @@ describe('lighting as a whole', () => {
       const model = build(preset.parameters);
       expect(model.liner).not.toBeNull();
       expect(model.perfCells.length).toBeGreaterThan(0);
-      expect(getPlanterChecks(model, acp).filter((check) => check.severity === 'error')).toEqual([]);
+      expect(getPlanterChecks(model).filter((check) => check.severity === 'error')).toEqual([]);
       // The panel window actually got cut on every one of them.
       expect(model.pieces.find((piece) => piece.id === 'rim')?.holes).toHaveLength(2);
     }
@@ -1456,8 +1726,8 @@ describe('lighting as a whole', () => {
       const cells = model.perfCells.flatMap((facet) => facet.cells).flat();
       expect(cells.every((point) => Number.isFinite(point.x) && Number.isFinite(point.y))).toBe(true);
       expect(buildPlanterDxf(model)).not.toMatch(/NaN/);
-      expect(buildPlanterSvg(model, acp, 'corner')).not.toMatch(/NaN/);
-      for (const check of getPlanterChecks(model, acp)) expect(check.detail).not.toMatch(/NaN|undefined/);
+      expect(buildPlanterSvg(model, 'corner')).not.toMatch(/NaN/);
+      for (const check of getPlanterChecks(model)) expect(check.detail).not.toMatch(/NaN|undefined/);
       if (model.liner) {
         expect(Number.isFinite(model.liner.litres)).toBe(true);
         expect(model.liner.inradius).toBeGreaterThan(0);
@@ -1467,18 +1737,18 @@ describe('lighting as a whole', () => {
 });
 
 describe('stone cladding', () => {
-  const ids = (model: PlanterModel) => getPlanterChecks(model, acp).map((check) => check.id);
+  const ids = (model: PlanterModel) => getPlanterChecks(model).map((check) => check.id);
   const JERUSALEM = 'yellow_stone_wall';
 
   it('leaves a design that never asked for stone completely alone', () => {
     const plain = build();
     expect(plain.parameters.stone).toBe('none');
     expect(plain.stone).toBeNull();
-    const stats = getPlanterStats(plain, acp);
+    const stats = getPlanterStats(plain);
     expect(stats.stone).toBeUndefined();
     expect(stats.coat).toBeUndefined();
     expect(ids(plain).some((id) => id.startsWith('stone-'))).toBe(false);
-    expect(buildPlanterSvg(plain, acp, 'Diamond')).not.toContain('PAINT');
+    expect(buildPlanterSvg(plain, 'Diamond')).not.toContain('PAINT');
   });
 
   /**
@@ -1557,7 +1827,7 @@ describe('stone cladding', () => {
     expect(thin.stone!.throat).toBeGreaterThan(0);
     expect(thick.stone!.throat).toBeLessThan(thin.stone!.throat);
     expect(ids(thick)).toContain('stone-perf');
-    const shut = getPlanterChecks(thick, acp).find((check) => check.id === 'stone-perf')!;
+    const shut = getPlanterChecks(thick).find((check) => check.id === 'stone-perf')!;
     expect(shut.severity).toBe(thick.stone!.throat <= 0 ? 'error' : 'warning');
     // A solid wall has no openings to lose, so the check has nothing to say.
     expect(ids(build({ stone: JERUSALEM, stoneCoat: MAX_COAT_MM }))).not.toContain('stone-perf');
@@ -1567,7 +1837,7 @@ describe('stone cladding', () => {
     expect(ids(build({ stone: JERUSALEM, stoneCoat: 1 }))).not.toContain('stone-weight');
     const heavy = build({ stone: JERUSALEM, stoneCoat: MAX_COAT_MM });
     expect(ids(heavy)).toContain('stone-weight');
-    expect(getPlanterChecks(heavy, acp).find((check) => check.id === 'stone-weight')!.title)
+    expect(getPlanterChecks(heavy).find((check) => check.id === 'stone-weight')!.title)
       .toContain(heavy.stone!.kg.toFixed(1));
   });
 
@@ -1577,7 +1847,7 @@ describe('stone cladding', () => {
   });
 
   it('sends the painter a card the cutter never sees', () => {
-    const svg = buildPlanterSvg(build({ stone: JERUSALEM, stoneCoat: 6, stoneSeal: 'satin' }), acp, 'Diamond');
+    const svg = buildPlanterSvg(build({ stone: JERUSALEM, stoneCoat: 6, stoneSeal: 'satin' }), 'Diamond');
     expect(svg).toContain('PAINT');
     expect(svg).toContain('ST124');
     expect(svg).toContain('Jerusalem Gold');
@@ -1588,7 +1858,7 @@ describe('stone cladding', () => {
   });
 
   it('reports the stone and what painting it costs, in the stats', () => {
-    const stats = getPlanterStats(build({ stone: JERUSALEM, stoneCoat: 6 }), acp);
+    const stats = getPlanterStats(build({ stone: JERUSALEM, stoneCoat: 6 }));
     expect(stats.stone).toContain('ST124');
     expect(stats.stone).toContain('6 mm');
     expect(stats.coat).toMatch(/coats · [\d.]+ L · [\d.]+ kg · [\d.]+ h · \d+ days?/);
@@ -1599,9 +1869,9 @@ describe('stone cladding', () => {
       ...DEFAULT_PLANTER, perforation: 'triangles', liner: true, led: '3000k',
       stone: JERUSALEM, stoneCoat: MAX_COAT_MM,
     });
-    const english = getPlanterChecks(model, acp).filter((check) => check.id.startsWith('stone-'));
+    const english = getPlanterChecks(model).filter((check) => check.id.startsWith('stone-'));
     expect(english.length).toBeGreaterThan(2);
-    const hebrew = checksHe(english, model, acp);
+    const hebrew = checksHe(english, model);
     for (const [i, check] of hebrew.entries()) {
       expect(check.title, check.id).not.toBe(english[i].title);
       expect(check.detail, check.id).not.toBe(english[i].detail);
@@ -1614,18 +1884,18 @@ describe('stone cladding', () => {
 });
 
 describe('direct UV printing', () => {
-  const ids = (model: PlanterModel) => getPlanterChecks(model, acp).map((check) => check.id);
+  const ids = (model: PlanterModel) => getPlanterChecks(model).map((check) => check.id);
   const printed: Partial<PlanterParameters> = { print: 'triangles', printPalette: 'carnival' };
 
   it('leaves a design that never asked to be printed completely alone', () => {
     const plain = build();
     expect(plain.parameters.print).toBe('none');
     expect(plain.print).toBeNull();
-    const stats = getPlanterStats(plain, acp);
+    const stats = getPlanterStats(plain);
     expect(stats.print).toBeUndefined();
     expect(stats.ink).toBeUndefined();
     expect(ids(plain).some((id) => id.startsWith('print-'))).toBe(false);
-    expect(buildPlanterSvg(plain, acp, 'Diamond')).not.toContain('PRINT — direct UV');
+    expect(buildPlanterSvg(plain, 'Diamond')).not.toContain('PRINT — direct UV');
   });
 
   it('cuts the same file whatever is printed on it', () => {
@@ -1777,16 +2047,20 @@ describe('direct UV printing', () => {
 
   it('refuses to have the print buried under the render', () => {
     const both = build({ ...printed, stone: 'yellow_stone_wall', stoneCoat: 6 });
-    const clash = getPlanterChecks(both, acp).find((check) => check.id === 'print-stone')!;
+    const clash = getPlanterChecks(both).find((check) => check.id === 'print-stone')!;
     expect(clash).toBeTruthy();
     expect(clash.severity).toBe('error');
     expect(ids(build(printed))).not.toContain('print-stone');
   });
 
   it('will not let a printed panel be folded hot without saying so', () => {
-    const model = build({ ...printed, sides: 4, rows: 1 });
-    expect(getPlanterChecks(model, getMaterial('acrylic-3')).map((c) => c.id)).toContain('print-heat');
-    expect(ids(model)).not.toContain('print-heat');
+    // Cut from acrylic, not merely quoted against it: the stock is part of the
+    // design now, so a pot that cannot be V-grooved is built that way from the
+    // start and every other number on it agrees.
+    const model = build({ ...printed, material: 'acrylic-3', sides: 4, rows: 1 });
+    expect(model.groove.heatBent).toBe(true);
+    expect(getPlanterChecks(model).map((c) => c.id)).toContain('print-heat');
+    expect(ids(build({ ...printed, sides: 4, rows: 1 }))).not.toContain('print-heat');
   });
 
   it('says when the nest will not go on the bed in one pass', () => {
@@ -1809,7 +2083,7 @@ describe('direct UV printing', () => {
   });
 
   it('reports the artwork and what printing it costs, in the stats', () => {
-    const stats = getPlanterStats(build({ ...printed, printRule: 'ramp' }), acp);
+    const stats = getPlanterStats(build({ ...printed, printRule: 'ramp' }));
     expect(stats.print).toContain('Carnival');
     expect(stats.print).toContain('Gradient');
     expect(stats.ink).toMatch(/\d passes? · [\d.]+ m2 · \d+ ml · \d+ min/);
@@ -1820,9 +2094,9 @@ describe('direct UV printing', () => {
       ...printed, printGrout: 0, print: 'image', printImage: '',
       stone: 'yellow_stone_wall', stoneCoat: 6, perforation: 'triangles', liner: true,
     });
-    const english = getPlanterChecks(model, acp).filter((check) => check.id.startsWith('print-'));
+    const english = getPlanterChecks(model).filter((check) => check.id.startsWith('print-'));
     expect(english.length).toBeGreaterThan(2);
-    const hebrew = checksHe(english, model, acp);
+    const hebrew = checksHe(english, model);
     for (const [i, check] of hebrew.entries()) {
       expect(check.title, check.id).not.toBe(english[i].title);
       expect(check.detail, check.id).not.toBe(english[i].detail);
