@@ -6,7 +6,6 @@ import { Download, Grid3x3, Maximize2, Pause, Play, RotateCcw, Rotate3D, Search,
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import * as THREE from 'three';
 import { CheckList, NumberField, SliderField } from '@/components/controls';
-import PlanterStudio, { type StudioStatus } from '@/components/PlanterStudio';
 import { CameraRig, StudioLights } from '@/components/three-stage';
 import { getPattern, PATTERNS } from '@/lib/patterns';
 import { chainFoldLines } from '@/lib/polyline';
@@ -360,17 +359,8 @@ function buildTicks(total: number): { value: number; label: string }[] {
 
 // ---------------------------------------------------------------------------
 
-type StudioMode = 'panel' | 'planter';
-
-const MODES: { id: StudioMode; label: string }[] = [
-  { id: 'panel', label: 'Panels' }, { id: 'planter', label: 'Planters' },
-];
 
 export default function AC3DStudio() {
-  const [mode, setMode] = useState<StudioMode>('panel');
-  // The planter workspace owns its own parameters; the shell only needs enough of
-  // its state to keep one status light and one readout honest for both modes.
-  const [planterStatus, setPlanterStatus] = useState<StudioStatus>({ blocking: false, readout: [] });
   const [parameters, setParameters] = useState<PatternParameters>(DEFAULT_PARAMETERS);
   const [materialId, setMaterialId] = useState<MaterialId>('acp-4');
   const [patternId, setPatternId] = useState<PatternId>('diamond-fold');
@@ -386,11 +376,8 @@ export default function AC3DStudio() {
   const stats = useMemo(() => getPatternStats(patternId, parameters, material), [patternId, parameters, material]);
   const mechanics = useMemo(() => getFoldMechanics(patternId, parameters, material), [patternId, parameters, material]);
   const checks = useMemo(() => getFabricationChecks(patternId, parameters, material), [patternId, parameters, material]);
-  const panelBlocking = checks.some((check) => check.severity === 'error');
-  const blocking = mode === 'panel' ? panelBlocking : planterStatus.blocking;
-  const readout = mode === 'panel'
-    ? [material.shortName, `${parameters.rows} × ${parameters.columns}`]
-    : planterStatus.readout;
+  const blocking = checks.some((check) => check.severity === 'error');
+  const readout = [material.shortName, `${parameters.rows} × ${parameters.columns}`];
 
   const filtered = PATTERNS.filter((item) =>
     (category === 'all' || item.category === category) &&
@@ -480,11 +467,6 @@ export default function AC3DStudio() {
           {readout.map((item) => <span key={item}><i />{item}</span>)}
         </div>
         <div className="top-actions">
-          <div className="view-presets" role="group" aria-label="Workspace">
-            {MODES.map((item) => (
-              <button key={item.id} className={`preset-pill ${mode === item.id ? 'active' : ''}`} aria-pressed={mode === item.id} onClick={() => setMode(item.id)}>{item.label}</button>
-            ))}
-          </div>
           <p className={`status ${blocking ? 'status-blocked' : 'status-ok'}`}>
             <i className="status-dot" />{blocking ? 'Not fabricable' : 'Ready to cut'}
           </p>
@@ -492,7 +474,6 @@ export default function AC3DStudio() {
       </header>
 
       <section className="workspace">
-        {mode === 'planter' ? <PlanterStudio onStatus={setPlanterStatus} /> : <>
         <aside className="panel left-panel">
           <div className="sidebar-section">
             <div className="panel-title">Pattern library <span className="tech-data">{filtered.length}/{PATTERNS.length}</span></div>
@@ -659,7 +640,7 @@ export default function AC3DStudio() {
             </div>
           </section>
         </aside>
-        </>}
+
       </section>
     </main>
   );
